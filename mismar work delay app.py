@@ -22,174 +22,80 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Lalezar&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap');
-
-    :root {
-        --asphalt: #14171C;
-        --panel: #1B1F26;
-        --panel-raised: #22262E;
-        --steel-line: #333941;
-        --paper: #ECE7DB;
-        --paper-dim: #9A968C;
-        --hazard: #F0A93B;
-        --hazard-dim: #7A5A22;
-        --rust: #B5592E;
-        --ink-red: #B3261E;
-        --ink-green: #2E7D5B;
-    }
-
-    html, body, [class*="css"] {
-        font-family: 'IBM Plex Sans Arabic', sans-serif;
+    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap');
+    
+    html, body, [class*="css"]  {
+        font-family: 'Tajawal', sans-serif;
         direction: rtl;
         text-align: right;
     }
-
+    
     .stApp {
-        background-color: var(--asphalt);
-        background-image:
-            repeating-linear-gradient(135deg, rgba(240,169,59,0.025) 0px, rgba(240,169,59,0.025) 2px, transparent 2px, transparent 26px);
-        color: var(--paper);
+        background-color: #0B0F19;
+        color: #F3F4F6;
     }
-
-    /* ===== لوحة العنوان: بلوك بيانات هندسي بزاوية تحذير مقصوصة ===== */
+    
     .mismar-header {
-        position: relative;
-        background: var(--panel);
-        padding: 30px 32px;
-        border: 1px solid var(--steel-line);
-        border-right: 5px solid var(--hazard);
-        margin-bottom: 30px;
-        overflow: hidden;
-        clip-path: polygon(0 0, 100% 0, 100% 100%, 28px 100%, 0 calc(100% - 28px));
+        background: linear-gradient(135deg, #134E4A 0%, #0F172A 100%);
+        padding: 28px;
+        border-radius: 20px;
+        border: 1px solid #14B8A633;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        margin-bottom: 28px;
+        text-align: center;
     }
-
-    .mismar-header::before {
-        content: "";
-        position: absolute;
-        top: 0; left: 0;
-        width: 90px; height: 90px;
-        background: repeating-linear-gradient(45deg, var(--hazard) 0 10px, var(--asphalt) 10px 20px);
-        clip-path: polygon(0 0, 100% 0, 0 100%);
-        opacity: 0.9;
-    }
-
-    .mismar-header .tag {
-        position: relative;
-        display: inline-block;
-        font-family: 'IBM Plex Sans Arabic', sans-serif;
-        font-size: 0.8rem;
-        letter-spacing: 0.04em;
-        color: var(--hazard);
-        border: 1px solid var(--hazard-dim);
-        padding: 3px 12px;
-        margin-bottom: 14px;
-        background: rgba(240,169,59,0.06);
-    }
-
+    
     .mismar-header h1 {
-        position: relative;
-        font-family: 'Lalezar', sans-serif;
-        font-weight: 400;
-        color: var(--paper);
-        font-size: 2.6rem;
-        line-height: 1.25;
-        margin-bottom: 10px;
+        color: #14B8A6;
+        font-weight: 800;
+        font-size: 2.2rem;
+        margin-bottom: 8px;
     }
 
     .mismar-header p {
-        position: relative;
-        color: var(--paper-dim);
-        font-size: 1rem;
-        max-width: 640px;
+        color: #9CA3AF;
+        font-size: 1.05rem;
     }
 
-    /* ===== بطاقة التبرير: شكل تذكرة أمر شغل مثقّبة ===== */
     .justification-card {
-        position: relative;
-        background: var(--panel-raised);
-        border: 1px solid var(--steel-line);
-        border-right: none;
-        padding: 26px 26px 26px 22px;
-        font-size: 1.12rem;
-        line-height: 2;
-        color: var(--paper);
-        margin-bottom: 4px;
+        background: linear-gradient(180deg, #111827 0%, #1F2937 100%);
+        border-right: 6px solid #14B8A6;
+        padding: 22px;
+        border-radius: 14px;
+        font-size: 1.15rem;
+        line-height: 1.95;
+        color: #F9FAFB;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        margin-bottom: 16px;
         white-space: pre-wrap;
     }
-
-    .justification-card::before {
-        content: "";
-        position: absolute;
-        top: 0; bottom: 0; right: 0;
-        width: 10px;
-        background-image: radial-gradient(circle, var(--asphalt) 2.5px, transparent 2.6px);
-        background-size: 10px 16px;
-        background-color: var(--hazard-dim);
-    }
-
-    .perforation {
-        border: none;
-        height: 0;
-        margin: 4px 0 20px 0;
-        border-top: 2px dashed var(--steel-line);
-    }
-
-    /* ===== بطاقة الأدلة: ورقة مخطط هندسي (Blueprint) ===== */
+    
     .evidence-card {
-        background-color: #10151C;
-        background-image:
-            linear-gradient(rgba(45,212,191,0.06) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(45,212,191,0.06) 1px, transparent 1px);
-        background-size: 22px 22px;
-        border: 1px solid var(--steel-line);
-        padding: 24px;
-        color: #C7CDD3;
-        line-height: 1.85;
+        background-color: #111827;
+        border: 1px solid #374151;
+        padding: 22px;
+        border-radius: 14px;
+        color: #D1D5DB;
+        line-height: 1.8;
         white-space: pre-wrap;
-        font-size: 0.98rem;
     }
 
-    /* ===== ختم التصنيف: طابع حبر حقيقي، مش شارة ===== */
-    @keyframes stampImpact {
-        0%   { transform: rotate(-16deg) scale(2.2); opacity: 0; }
-        55%  { transform: rotate(-2deg) scale(0.95); opacity: 1; }
-        75%  { transform: rotate(-5deg) scale(1.05); }
-        100% { transform: rotate(-4deg) scale(1); }
-    }
-
-    .verdict-stamp {
-        display: inline-block;
-        font-family: 'Lalezar', sans-serif;
-        font-size: 1.3rem;
-        padding: 10px 26px;
-        border: 3px solid currentColor;
-        border-radius: 6px;
-        transform: rotate(-4deg);
-        animation: stampImpact 0.45s ease-out;
-        margin-bottom: 20px;
-        letter-spacing: 0.02em;
-    }
-    .verdict-stamp.clear { color: var(--ink-green); }
-    .verdict-stamp.flagged { color: var(--ink-red); }
-
-    /* ===== الزرار: مفتاح تشغيل صناعي ===== */
     .stButton>button {
         width: 100%;
-        background: var(--hazard);
-        color: #1A1300;
-        font-family: 'IBM Plex Sans Arabic', sans-serif;
+        background: linear-gradient(90deg, #14B8A6 0%, #0D9488 100%);
+        color: #FFFFFF;
         font-weight: 700;
-        font-size: 1.1rem;
+        font-size: 1.15rem;
         padding: 14px;
-        border-radius: 4px;
+        border-radius: 12px;
         border: none;
-        box-shadow: inset 0 -4px 0 rgba(0,0,0,0.25);
-        transition: transform 0.12s ease, box-shadow 0.12s ease;
+        box-shadow: 0 4px 14px rgba(20, 184, 166, 0.3);
+        transition: all 0.3s ease;
     }
-
+    
     .stButton>button:hover {
-        transform: translateY(2px);
-        box-shadow: inset 0 -2px 0 rgba(0,0,0,0.25);
+        background: linear-gradient(90deg, #0D9488 0%, #0F766E 100%);
+        transform: translateY(-2px);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -506,7 +412,7 @@ def call_gemini_with_fallback(api_key: str, prompt_text: str) -> str:
 
 with st.sidebar:
     st.image("https://mismarapp.com/static/media/logo.f6cf70e4.svg", width=200)
-    st.markdown("**إعدادات الاتصال**")
+    st.markdown("### ⚙️ إعدادات النظام")
 
     api_key_input = st.text_input(
         "Gemini API Key",
@@ -522,28 +428,27 @@ with st.sidebar:
 
 st.markdown("""
 <div class="mismar-header">
-    <span class="tag">تذكرة تدقيق — قسم العمليات</span>
-    <h1>سجل تعطل جاري العمل</h1>
-    <p>استخراج السبب الجذري وراء تأخر تنفيذ الإصلاحات وتحديد الطرف أو العامل المتسبب، بالاعتماد على سجل الحالات والتذاكر والمحادثات الفعلية للطلب.</p>
+    <h1>🛠️ نظام تدقيق تعطل جاري العمل (MisMar Work Delay Audit)</h1>
+    <p>استخراج السبب الجذري وراء تأخر تنفيذ الإصلاحات وتحديد الطرف أو العامل المتسبب</p>
 </div>
 """, unsafe_allow_html=True)
 
 col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
-    st.subheader("بيانات الطلب")
+    st.subheader("📋 بيانات الطلب")
     order_id = st.number_input("رقم الطلب (Order ID)", value=1029480, step=1)
     st.markdown("<br>", unsafe_allow_html=True)
-    analyze_btn = st.button("تشغيل التشخيص")
+    analyze_btn = st.button("🚀 استخراج تبرير تعطل جاري العمل")
 
 with col2:
-    st.subheader("نتيجة التدقيق")
+    st.subheader("📊 مخرجات التقرير والتدقيق")
 
     if analyze_btn:
         if not api_key_input:
-            st.error("يرجى إدخال Gemini API Key أولاً من القائمة الجانبية.")
+            st.error("⚠️ يرجى إدخال Gemini API Key أولاً من القائمة الجانبية.")
         else:
-            with st.spinner("جاري فحص سجل الحالة والتذاكر والتعليقات..."):
+            with st.spinner("⏳ جاري فحص أسباب تعطل مرحلة جاري العمل..."):
                 try:
                     full_response, work_debug = analyze_work_delay(
                         api_key_input, order_id
@@ -579,28 +484,26 @@ with col2:
         safe_evidence = html.escape(res["evidence"])
         safe_classification = html.escape(res.get("classification", "غير محدد"))
 
-        # ختم "تم الفحص، لا يوجد تأخير" أخضر يختلف عن ختم "متسبب محدد" الأحمر —
-        # الشكل نفسه بيحمل معنى بصري (زي ختم موظف الجودة على أمر الشغل)
-        stamp_class = "clear" if "لا يوجد تأخير" in res.get("classification", "") else "flagged"
         st.markdown(
-            f'<div class="verdict-stamp {stamp_class}">{safe_classification}</div>',
+            f'<div style="display:inline-block; background:#14B8A6; color:#0B0F19; '
+            f'font-weight:800; padding:8px 18px; border-radius:999px; margin-bottom:14px; '
+            f'font-size:1.05rem;">🏷️ التصنيف النهائي: {safe_classification}</div>',
             unsafe_allow_html=True
         )
 
-        st.markdown("**السبب الجذري**")
+        st.markdown("### 📝 التبرير التشغيلي لتعطل جاري العمل:")
         st.markdown(f'<div class="justification-card">{safe_justification}</div>', unsafe_allow_html=True)
-        st.markdown('<hr class="perforation">', unsafe_allow_html=True)
 
-        st.text_area("نسخ نص التبرير:", value=res["justification"], height=110)
+        st.text_area("📋 اضغط Ctrl+A ثم Ctrl+C للنسخ المباشر:", value=res["justification"], height=120)
 
-        st.markdown("**الأدلة والوقائع**")
+        st.markdown("### 🔍 الأدلة والوقائع التفصيلية:")
         st.markdown(f'<div class="evidence-card">{safe_evidence}</div>', unsafe_allow_html=True)
 
-        with st.expander("الحقائق الزمنية المحسوبة برمجيًا (للتحقق)"):
+        with st.expander("🛠️ (Debug) مدة حالة جاري العمل المحسوبة برمجيًا فعليًا"):
             st.markdown(
-                "محسوبة مباشرة من التواريخ الخام بكود بايثون، مش من الموديل — "
-                "قارنها بالتقرير فوق للتأكد من الالتزام الحرفي بها:"
+                "الأرقام دي محسوبة مباشرة بكود بايثون من التواريخ الخام (مش من الموديل)، "
+                "قارنها بالتقرير فوق للتأكد إن الموديل التزم بيها حرفيًا:"
             )
             st.text(res.get("work_debug", "لا توجد بيانات."))
     elif not analyze_btn:
-        st.info("أدخل رقم الطلب ودوس تشغيل التشخيص لعرض النتيجة هنا.")
+        st.info("👈 قم بإدخال رقم الطلب والضغط على زر التحليل لعرض تبرير تعطل جاري العمل هنا.")
