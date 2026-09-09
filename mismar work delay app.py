@@ -274,12 +274,35 @@ def analyze_work_delay(api_key: str, order_id: int):
             return no_delay_text, no_delay_text
 
     if not last_work_status:
+        status_history_raw = order_data.get('status_history')
+
+        if isinstance(status_history_raw, list) and status_history_raw:
+            # نجمع كل أسماء الحالات الفعلية الموجودة في البيانات عشان نعرف فورًا
+            # هل الاسم "جاري العمل" مختلف شوية، أو الحالة دي مش موجودة أصلاً في رحلة الطلب ده
+            found_statuses = []
+            for row in status_history_raw:
+                if isinstance(row, dict):
+                    name = row.get("Status_Name") or row.get("status_name") or row.get("status")
+                    if name and name not in found_statuses:
+                        found_statuses.append(name)
+            diag_detail = (
+                f"عدد الحالات المسترجعة: {len(status_history_raw)}.\n"
+                f"أسماء الحالات الفعلية الموجودة في هذا الطلب:\n- " + "\n- ".join(found_statuses)
+                if found_statuses else
+                "البيانات مسترجعة لكن مفيش فيها أسماء حالات واضحة (شكل غير متوقع للـ JSON)."
+            )
+        elif isinstance(status_history_raw, str):
+            # يبقى fetch_order_data سجّل رسالة خطأ (Error HTTP.../Error:...) بدل بيانات فعلية
+            diag_detail = f"تعذر جلب سجل الحالات أصلاً من Metabase. الرسالة الخام: {status_history_raw[:300]}"
+        else:
+            diag_detail = "لم يتم استرجاع أي بيانات لسجل الحالات لهذا الطلب (النتيجة فاضية أو None)."
+
         no_data_text = (
             "تعذر العثور على مرحلة جاري العمل واضحة في سجل حالات هذا الطلب."
-            "\n===SPLIT===\nلا توجد بيانات كافية للتحليل."
+            f"\n===SPLIT===\n{diag_detail}"
             "\n===CLASSIFICATION===\nلا يوجد تأخير"
         )
-        return no_data_text, no_data_text
+        return no_data_text, diag_detail
 
     last_status_note = (
         f"⏱️ مدة *آخر* مرة دخل فيها الطلب حالة '{WORK_STATUS_NAME}':\n"
