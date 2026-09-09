@@ -2,10 +2,15 @@ import html
 import json
 import os
 import re
+import time
 import urllib.parse
 from datetime import datetime, timedelta
 import requests
 import streamlit as st
+
+# قائمة الموديلات بالترتيب: لو الأول مزدحم (503) أو مش موجود (404)، الكود يجرب اللي بعده تلقائيًا
+MODEL_FALLBACK_LIST = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash"]
+RETRY_DELAYS_SECONDS = [4, 10]  # نجرب نفس الموديل 3 مرات إجمالي (محاولة أولى + محاولتين إعادة) قبل الانتقال للموديل التالي
 
 # إعدادات الصفحة الرسمية لمسمار
 st.set_page_config(
@@ -330,7 +335,7 @@ def compute_last_diagnosis_duration(status_history):
     return matches[-1]
 
 
-def analyze_diagnosis_delay(api_key: str, model_name: str, order_id: int):
+def analyze_diagnosis_delay(api_key: str, order_id: int):
     """يرجع tuple: (نص رد الموديل, الحقائق الزمنية المحسوبة للتحقق منها في الواجهة)"""
     order_data = fetch_order_data(order_id)
     timeline_facts = compute_timeline_facts(order_data.get('status_history'))
@@ -433,50 +438,68 @@ def analyze_diagnosis_delay(api_key: str, model_name: str, order_id: int):
     - اختر التصنيف الأقرب لواقع الأدلة فقط، ولا تخترع تصنيفاً من عندك خارج هذه القائمة.
     """
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-    headers = {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': api_key
-    }
-    data = {
-        "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "topP": 0.9
-        }
-    }
+    return call_gemini_with_fallback(api_key, prompt_text), timeline_facts
 
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=60)
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"تعذر الوصول إلى خدمة Gemini (مشكلة شبكة): {str(e)}")
 
-    if response.status_code == 200:
-        result_json = response.json()
-        try:
-            model_text = result_json['candidates'][0]['content']['parts'][0]['text']
-            return model_text, timeline_facts
-        except (KeyError, IndexError):
-            raise Exception(
-                "الاتصال نجح لكن شكل الرد غير متوقع (على الأرجح تم حظر المحتوى أو انتهت الحصة/الـ quota). "
-                f"الرد الكامل: {json.dumps(result_json, ensure_ascii=False)[:800]}"
-            )
-    elif response.status_code == 401:
-        raise Exception(
-            "خطأ مصادقة (401): المفتاح غير صالح أو منتهي الصلاحية. "
-            "اعمل مفتاح جديد من https://aistudio.google.com/app/apikey"
-        )
-    elif response.status_code == 404:
-        raise Exception(
-            f"اسم الموديل '{model_name}' غير موجود أو غير متاح لحسابك (404). "
-            "جرّب اسم موديل آخر من صفحة الموديلات المتاحة في حسابك."
-        )
-    elif response.status_code == 503:
-        raise Exception(
-            "خطأ 503: الموديل مزدحم مؤقتًا من عند Google، جرب تاني بعد شوية أو غيّر اسم الموديل مؤقتًا."
-        )
-    else:
-        raise Exception(f"خطأ في الاتصال بالذكاء الاصطناعي ({response.status_code}): {response.text}")
+def call_gemini_with_fallback(api_key: str, prompt_text: str) -> str:
+    """
+    يجرب كل موديل في MODEL_FALLBACK_LIST بالترتيب، وبيعيد المحاولة على نفس الموديل
+    كذا مرة (بفاصل زمني) لو الخطأ 503 (زحمة مؤقتة) قبل ما ينتقل للموديل اللي بعده.
+    خطأ 401 (مصادقة) بيوقف فورًا لأنه مش هيتحل بتغيير الموديل.
+    """
+    attempt_errors = []
+
+    for model_name in MODEL_FALLBACK_LIST:
+        for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            headers = {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': api_key
+            }
+            data = {
+                "contents": [{"parts": [{"text": prompt_text}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "topP": 0.9
+                }
+            }
+
+            try:
+                response = requests.post(url, headers=headers, json=data, timeout=60)
+            except requests.exceptions.RequestException as e:
+                attempt_errors.append(f"{model_name}: تعذر الوصول (مشكلة شبكة) — {str(e)}")
+                break  # مشكلة شبكة مش هتتحل بإعادة المحاولة على نفس الموديل فورًا، ننتقل للتالي
+
+            if response.status_code == 200:
+                result_json = response.json()
+                try:
+                    return result_json['candidates'][0]['content']['parts'][0]['text']
+                except (KeyError, IndexError):
+                    attempt_errors.append(
+                        f"{model_name}: رد بشكل غير متوقع (200 لكن بدون نص) — "
+                        f"{json.dumps(result_json, ensure_ascii=False)[:200]}"
+                    )
+                    break
+
+            elif response.status_code == 401:
+                raise Exception(
+                    "خطأ مصادقة (401): المفتاح غير صالح أو منتهي الصلاحية. "
+                    "اعمل مفتاح جديد من https://aistudio.google.com/app/apikey"
+                )
+
+            elif response.status_code == 503 and attempt < len(RETRY_DELAYS_SECONDS):
+                # زحمة مؤقتة على نفس الموديل، ننتظر شوية ونعيد المحاولة على نفس الموديل قبل ما نيأس منه
+                time.sleep(RETRY_DELAYS_SECONDS[attempt])
+                continue
+
+            else:
+                attempt_errors.append(
+                    f"{model_name}: خطأ {response.status_code} (بعد {attempt + 1} محاولة/محاولات) — "
+                    f"{response.text[:200]}"
+                )
+                break
+
+    raise Exception("فشلت كل الموديلات المتاحة:\n" + "\n".join(attempt_errors))
 
 
 with st.sidebar:
@@ -490,10 +513,9 @@ with st.sidebar:
         help="أدخل مفتاح الـ API الخاص بـ Gemini"
     )
 
-    model_name_input = st.text_input(
-        "اسم الموديل (Model Name)",
-        value="gemini-3.6-flash",
-        help="غيّرها هنا لو ظهر خطأ 404 يفيد إن الموديل غير متاح، بدون الحاجة لتعديل الكود"
+    st.caption(
+        "🔁 الموديلات المستخدمة بالترتيب (فولباك تلقائي لو موديل مزدحم أو غير متاح): "
+        + " ← ".join(MODEL_FALLBACK_LIST)
     )
 
 st.markdown("""
@@ -521,7 +543,7 @@ with col2:
             with st.spinner("⏳ جاري فحص أسباب تعطل مرحلة الفحص والتشخيص..."):
                 try:
                     full_response, timeline_debug = analyze_diagnosis_delay(
-                        api_key_input, model_name_input, order_id
+                        api_key_input, order_id
                     )
 
                     if "===CLASSIFICATION===" in full_response:
