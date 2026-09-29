@@ -1,532 +1,610 @@
-import html
-import json
-import os
-import re
-import time
-import urllib.parse
-from datetime import datetime, timedelta
-import requests
-import streamlit as st
+/**
+ * سكريبت تدقيق تعطل "جاري العمل" — يعمل مباشرة جوه Google Sheets
+ * ------------------------------------------------------------
+ * نفس منطق كود بايثون بالظبط: نفس حساب ساعات العمل (9ص-6م)، استبعاد يوم
+ * الجمعة، تصحيح فرق التوقيت (+3 ساعات)، عتبة الـ4 ساعات، ونفس البرومبت
+ * والتصنيفات، لكن بيشتغل جوه الشيت مباشرة من غير Streamlit خالص.
+ *
+ * ====== شكل الشيت المتوقع ======
+ * - عمود A: رابط الطلب (رقم الطلب بيتاخد تلقائيًا من آخر جزء في الرابط)
+ * - عمود S: هنا بيتحط السبب الجذري (التبرير)
+ * - عمود T: هنا بيتحط التصنيف النهائي
+ * - أول صفين (1 و2) عناوين/تاريخ تحديث، البيانات الفعلية تبدأ من صف 3
+ *
+ * ⚠️ ملحوظة مهمة: الروابط العامة (Public Links) بتاعة Metabase اتلغت، فالكود
+ * دلوقتي بيسجّل دخول برمجيًا بيوزر نيم وباسورد حقيقيين (محفوظين بأمان في
+ * إعدادات المشروع، مش مكتوبين في الكود)، وبيستخدم أرقام الأسئلة الداخلية
+ * (Card ID) مباشرة بدل الرابط العام.
+ *
+ * ====== طريقة التركيب ======
+ * 1. افتح الشيت، من القائمة: Extensions > Apps Script
+ * 2. امسح أي كود موجود في Code.gs والصق الكود ده مكانه بالكامل
+ * 3. احفظ (Ctrl+S)
+ * 4. ارجع للشيت واعمل Refresh للصفحة، هتلاقي قائمة "تدقيق مسمار" جديدة
+ * 5. من القائمة دي: دوس "ضبط مفتاح Gemini API" واكتب مفتاحك مرة واحدة بس
+ * 6. وبرضو دوس "ضبط بيانات دخول Metabase" واكتب يوزر نيم وباسورد حسابك في Metabase
+ * 7. لو عايز التشغيل يبقى تلقائي كل يوم: دوس "تفعيل التشغيل التلقائي (9:30 صباحًا يوميًا)"
+ * 8. أو شغّله يدويًا وقت ما تحب من "تشغيل التدقيق على الصفوف الجديدة"
+ *
+ * ملحوظة: لو ترتيب أعمدتك اتغيّر يومًا ما، غيّر أرقام COLUMNS تحت فقط.
+ */
 
-# قائمة الموديلات بالترتيب: لو الأول مزدحم (503) أو مش موجود (404)، الكود يجرب اللي بعده تلقائيًا
-MODEL_FALLBACK_LIST = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash"]
-RETRY_DELAYS_SECONDS = [4, 10]  # نجرب نفس الموديل 3 مرات إجمالي (محاولة أولى + محاولتين إعادة) قبل الانتقال للموديل التالي
+// ====== إعدادات الأعمدة — مطابقة لشكل شيت مسمار الفعلي ======
+var COLUMNS = {
+  ORDER_ID: 1,       // العمود A: رابط الطلب (رقم الطلب بيتاخد من آخر جزء في اللينك)
+  JUSTIFICATION: 19, // العمود S: عمود "اخر تحديث" اللي هيتحط فيه السبب الجذري
+  CLASSIFICATION: 20 // العمود T: التصنيف النهائي
+};
+var HEADER_ROWS = 2; // صف تاريخ التحديث + صف أسماء الأعمدة
 
-# إعدادات الصفحة الرسمية لمسمار
-st.set_page_config(
-    page_title="نظام تدقيق تعطل جاري العمل | مسمار MisMar",
-    page_icon="🛠️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+// قائمة الموديلات بالترتيب: لو الأول مزدحم (503) أو مش موجود (404)، الكود يجرب اللي بعده تلقائيًا
+// (gemini-2.5-flash اتشال من القائمة لأنه بيرجّع 404 فعليًا رغم إن موعد إيقافه الرسمي أكتوبر 2026)
+var MODEL_FALLBACK_LIST = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash"];
 
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap');
-    
-    html, body, [class*="css"]  {
-        font-family: 'Tajawal', sans-serif;
-        direction: rtl;
-        text-align: right;
-    }
-    
-    .stApp {
-        background-color: #0B0F19;
-        color: #F3F4F6;
-    }
-    
-    .mismar-header {
-        background: linear-gradient(135deg, #134E4A 0%, #0F172A 100%);
-        padding: 28px;
-        border-radius: 20px;
-        border: 1px solid #14B8A633;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-        margin-bottom: 28px;
-        text-align: center;
-    }
-    
-    .mismar-header h1 {
-        color: #14B8A6;
-        font-weight: 800;
-        font-size: 2.2rem;
-        margin-bottom: 8px;
-    }
+// ⚠️ الروابط العامة (public links) بتاعة Metabase اتلغت، فبقينا نسجّل دخول
+// برمجيًا بيوزر/باسورد حقيقيين، ونستخدم أرقام الأسئلة الداخلية (Card ID) مباشرة
+var METABASE_BASE_URL = "https://analysis.mismarapp.com";
+var METABASE_CARD_IDS = {
+  tickets: 15395,
+  comments: 15394,
+  status_history: 15393
+};
 
-    .mismar-header p {
-        color: #9CA3AF;
-        font-size: 1.05rem;
-    }
+// بنخزّن التوكن في متغير على مستوى الملف عشان نسجّل دخول مرة واحدة بس لكل تشغيلة
+var _cachedSessionToken = null;
 
-    .justification-card {
-        background: linear-gradient(180deg, #111827 0%, #1F2937 100%);
-        border-right: 6px solid #14B8A6;
-        padding: 22px;
-        border-radius: 14px;
-        font-size: 1.15rem;
-        line-height: 1.95;
-        color: #F9FAFB;
-        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-        margin-bottom: 16px;
-        white-space: pre-wrap;
-    }
-    
-    .evidence-card {
-        background-color: #111827;
-        border: 1px solid #374151;
-        padding: 22px;
-        border-radius: 14px;
-        color: #D1D5DB;
-        line-height: 1.8;
-        white-space: pre-wrap;
-    }
+function setMetabaseCredentials() {
+  var ui = SpreadsheetApp.getUi();
+  var userResponse = ui.prompt('أدخل يوزر نيم/إيميل حساب Metabase:', ui.ButtonSet.OK_CANCEL);
+  if (userResponse.getSelectedButton() != ui.Button.OK) return;
 
-    .stButton>button {
-        width: 100%;
-        background: linear-gradient(90deg, #14B8A6 0%, #0D9488 100%);
-        color: #FFFFFF;
-        font-weight: 700;
-        font-size: 1.15rem;
-        padding: 14px;
-        border-radius: 12px;
-        border: none;
-        box-shadow: 0 4px 14px rgba(20, 184, 166, 0.3);
-        transition: all 0.3s ease;
-    }
-    
-    .stButton>button:hover {
-        background: linear-gradient(90deg, #0D9488 0%, #0F766E 100%);
-        transform: translateY(-2px);
-    }
-</style>
-""", unsafe_allow_html=True)
+  var passResponse = ui.prompt('أدخل باسورد حساب Metabase:', ui.ButtonSet.OK_CANCEL);
+  if (passResponse.getSelectedButton() != ui.Button.OK) return;
 
-METABASE_ENDPOINTS = {
-    "tickets": "https://analysis.mismarapp.com/public/question/5f313cbe-6bb4-43bc-9b4d-70b8de7d17d4.json",
-    "comments": "https://analysis.mismarapp.com/public/question/82aba25f-d368-44e3-8392-dce163d78e23.json",
-    "status_history": "https://analysis.mismarapp.com/public/question/98fe13e6-298a-4775-8244-3015c9c720fe.json",
-    "pricing": "https://analysis.mismarapp.com/public/question/b0114e1f-8577-4faa-a790-eaa2412f39f6.json"
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('METABASE_USERNAME', userResponse.getResponseText().trim());
+  props.setProperty('METABASE_PASSWORD', passResponse.getResponseText().trim());
+  ui.alert('تم حفظ بيانات دخول Metabase بنجاح.');
 }
 
-# اسم الحالة بالظبط زي ما بيرجع من status_history
-WORK_STATUS_NAME = "جاري العمل"
-
-# التصنيفات المسموح بها حصريًا للنتيجة النهائية لتأخير جاري العمل
-WORK_CLASSIFICATIONS = [
-    "قطع الغيار", "التشغيل", "عميل", "مركز", "لا يوجد تأخير", "تأخير في الشحن",
-    "خلل تقني", "تم التسليم", "يوم الجمعة", "تشخيص إضافي", "مكرر",
-    "قطع الغيار والمركز", "نقل مركز آخر", "التشغيل والمركز", "قطع الغيار والتشغيل",
-    "قطع الغيار وطلبية", "تشخيص مركز خاطئ"
-]
-
-# ساعات العمل المعتبرة لمرحلة جاري العمل تحديدًا: 9 صباحًا - 6 مساءً
-WORK_START_HOUR = 9
-WORK_END_HOUR = 18
-FRIDAY_WEEKDAY = 4  # في بايثون: الإثنين=0 ... الجمعة=4 ... الأحد=6
-
-
-def build_metabase_url(base_url: str, order_id: int) -> str:
-    """يبني رابط الطلب بالصيغة الرسمية اللي Metabase محتاجها لتمرير قيمة لمتغير SQL اسمه order_id"""
-    parameters = [
-        {
-            "type": "number/=",
-            "target": ["variable", ["template-tag", "order_id"]],
-            "value": str(order_id)
-        }
-    ]
-    encoded_params = urllib.parse.quote(json.dumps(parameters))
-    return f"{base_url}?parameters={encoded_params}"
-
-
-def fetch_order_data(order_id: int) -> dict:
-    """جلب بيانات الطلب الكاملة من المصادر الأربعة في Metabase"""
-    payload = {}
-    for key, url in METABASE_ENDPOINTS.items():
-        try:
-            full_url = build_metabase_url(url, order_id)
-            res = requests.get(full_url, timeout=15)
-            if res.status_code == 200:
-                try:
-                    payload[key] = res.json()
-                except ValueError:
-                    payload[key] = f"Error: Response wasn't valid JSON: {res.text[:200]}"
-            else:
-                payload[key] = f"Error HTTP {res.status_code}"
-        except requests.exceptions.RequestException as e:
-            payload[key] = f"Error: {str(e)}"
-    return payload
-
-
-def _parse_dt(value: str):
-    """
-    يحاول يفهم صيغة التاريخ القادمة من Metabase (مثال: 2026-08-10 04:04 PM)
-    ⚠️ Metabase بيرجّع التوقيت متأخر 3 ساعات عن التوقيت الفعلي بالسعودية،
-    فبنضيف 3 ساعات هنا في نقطة التحليل نفسها قبل أي حساب لاحق.
-    """
-    if not value:
-        return None
-    formats = [
-        "%Y-%m-%d %I:%M %p",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-    ]
-    for fmt in formats:
-        try:
-            parsed = datetime.strptime(value.strip(), fmt)
-            return parsed + timedelta(hours=3)
-        except (ValueError, AttributeError):
-            continue
-    return None
-
-
-def _format_timedelta(td) -> str:
-    total_minutes = int(td.total_seconds() // 60)
-    days, rem_minutes = divmod(total_minutes, 24 * 60)
-    hours, minutes = divmod(rem_minutes, 60)
-    parts = []
-    if days:
-        parts.append(f"{days} يوم")
-    if hours:
-        parts.append(f"{hours} ساعة")
-    if minutes or not parts:
-        parts.append(f"{minutes} دقيقة")
-    return " و".join(parts)
-
-
-def business_hours_duration(start: datetime, end: datetime) -> timedelta:
-    """يحسب ساعات العمل الفعلية بين تاريخين، مستبعدًا خارج 9ص-6م ويوم الجمعة بالكامل"""
-    if start >= end:
-        return timedelta(0)
-    total = timedelta(0)
-    current = start
-    while current < end:
-        day_work_start = current.replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
-        day_work_end = current.replace(hour=WORK_END_HOUR, minute=0, second=0, microsecond=0)
-        if current.weekday() != FRIDAY_WEEKDAY:
-            segment_start = max(current, day_work_start)
-            segment_end = min(end, day_work_end)
-            if segment_start < segment_end:
-                total += segment_end - segment_start
-        next_day = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        current = next_day
-    return total
-
-
-def compute_last_status_duration(status_history, status_name):
-    """
-    يحسب مدة *آخر* مرة فقط دخل فيها الطلب حالة معينة (مش مجموع كل المرات).
-    يرجع dict فيه: duration (خام)، business_duration (ساعات عمل فعلية)، opened، closed، still_active
-    أو None لو الحالة دي مش موجودة خالص في تاريخ الطلب.
-    """
-    if not isinstance(status_history, list) or not status_history:
-        return None
-
-    matches = []
-    for row in status_history:
-        if not isinstance(row, dict):
-            continue
-        row_status_name = row.get("Status_Name") or row.get("status_name") or row.get("status")
-        if row_status_name != status_name:
-            continue
-        opened_raw = row.get("Opened_At") or row.get("opened_at") or row.get("created_at")
-        closed_raw = row.get("Closed_At") or row.get("closed_at") or row.get("ended_at")
-        opened_dt = _parse_dt(opened_raw)
-
-        still_active = bool(closed_raw and str(closed_raw).strip().lower() == "currently active")
-        closed_dt = datetime.now() if still_active else _parse_dt(closed_raw)
-
-        if opened_dt and closed_dt:
-            matches.append({
-                "opened": opened_dt,
-                "closed": closed_dt,
-                "duration": closed_dt - opened_dt,
-                "business_duration": business_hours_duration(opened_dt, closed_dt),
-                "still_active": still_active,
-            })
-
-    if not matches:
-        return None
-
-    matches.sort(key=lambda r: r["opened"])
-    return matches[-1]
-
-
-def analyze_work_delay(api_key: str, order_id: int):
-    """يرجع tuple: (نص رد الموديل, ملخص محسوب للتحقق منه في الواجهة)"""
-    order_data = fetch_order_data(order_id)
-    last_work_status = compute_last_status_duration(order_data.get('status_history'), WORK_STATUS_NAME)
-
-    # 🛑 قصير الدائرة: لو آخر مرة دخل فيها الطلب حالة "جاري العمل" كانت أقل من 4 ساعات
-    # عمل فعلية، نرجّع "لا يوجد تأخير" مباشرة من غير استدعاء الموديل
-    NO_DELAY_THRESHOLD_HOURS = 4
-    if last_work_status and not last_work_status["still_active"]:
-        business_hours = last_work_status["business_duration"].total_seconds() / 3600
-        if business_hours < NO_DELAY_THRESHOLD_HOURS:
-            no_delay_text = (
-                f"لا يوجد تأخير، حيث استغرقت مرحلة {WORK_STATUS_NAME} "
-                f"{_format_timedelta(last_work_status['business_duration'])} ساعات عمل فعلية فقط، وهي مدة طبيعية."
-                f"\n===SPLIT===\n"
-                f"مدة حالة {WORK_STATUS_NAME} بساعات العمل الفعلية: {_format_timedelta(last_work_status['business_duration'])} "
-                f"(من {last_work_status['opened']} إلى {last_work_status['closed']})، "
-                f"وهي أقل من الحد الأدنى المعتبر تأخيرًا (4 ساعات عمل)."
-                f"\n===CLASSIFICATION===\nلا يوجد تأخير"
-            )
-            return no_delay_text, no_delay_text
-
-    if not last_work_status:
-        status_history_raw = order_data.get('status_history')
-
-        if isinstance(status_history_raw, list) and status_history_raw:
-            # نجمع كل أسماء الحالات الفعلية الموجودة في البيانات عشان نعرف فورًا
-            # هل الاسم "جاري العمل" مختلف شوية، أو الحالة دي مش موجودة أصلاً في رحلة الطلب ده
-            found_statuses = []
-            for row in status_history_raw:
-                if isinstance(row, dict):
-                    name = row.get("Status_Name") or row.get("status_name") or row.get("status")
-                    if name and name not in found_statuses:
-                        found_statuses.append(name)
-            diag_detail = (
-                f"عدد الحالات المسترجعة: {len(status_history_raw)}.\n"
-                f"أسماء الحالات الفعلية الموجودة في هذا الطلب:\n- " + "\n- ".join(found_statuses)
-                if found_statuses else
-                "البيانات مسترجعة لكن مفيش فيها أسماء حالات واضحة (شكل غير متوقع للـ JSON)."
-            )
-        elif isinstance(status_history_raw, str):
-            # يبقى fetch_order_data سجّل رسالة خطأ (Error HTTP.../Error:...) بدل بيانات فعلية
-            diag_detail = f"تعذر جلب سجل الحالات أصلاً من Metabase. الرسالة الخام: {status_history_raw[:300]}"
-        else:
-            diag_detail = "لم يتم استرجاع أي بيانات لسجل الحالات لهذا الطلب (النتيجة فاضية أو None)."
-
-        no_data_text = (
-            "تعذر العثور على مرحلة جاري العمل واضحة في سجل حالات هذا الطلب."
-            f"\n===SPLIT===\n{diag_detail}"
-            "\n===CLASSIFICATION===\nلا يوجد تأخير"
-        )
-        return no_data_text, diag_detail
-
-    last_status_note = (
-        f"⏱️ مدة *آخر* مرة دخل فيها الطلب حالة '{WORK_STATUS_NAME}':\n"
-        f"- المدة الخام (شاملة كل الأوقات): {_format_timedelta(last_work_status['duration'])}\n"
-        f"- مدة ساعات العمل الفعلية فقط (بعد استبعاد ما هو خارج 9ص-6م ويوم الجمعة): "
-        f"{_format_timedelta(last_work_status['business_duration'])}"
-        + (" (لسه شغالة/جارية حتى الآن)" if last_work_status["still_active"] else "")
-        + f"\nمن {last_work_status['opened']} إلى {last_work_status['closed']}.\n"
-        + "⚠️ تنبيه: هذا الرقم وحده لا يعني تلقائيًا وجود تأخير. افحص التذاكر والتعليقات أولاً "
-        + "لمعرفة هل هذا وقت عمل فعلي وتحديثات مستمرة، أم فجوة صمت وتعطل حقيقي."
-    )
-
-    prompt_text = f"""
-    أنت كبير مدققي العمليات في شركة صيانة السيارات (مسمار - MisMar).
-    مطلوب تحديد السبب الجذري وراء التأخير (إن وجد) في آخر مرة دخل فيها الطلب رقم #{order_id} مرحلة "{WORK_STATUS_NAME}".
-
-    ⚠️ === الحقيقة الزمنية الحاسمة (إلزامية الاستخدام، ولا تحسب من عندك) === ⚠️
-    {last_status_note}
-
-    البيانات المتاحة للطلب (التركيز الأساسي هنا على التذاكر والتعليقات):
-    1. 🎫 تذاكر الشكاوى والمتابعة — المصدر الأهم هنا لمعرفة سبب تعطل التنفيذ (خذ نظرة عامة على كل التذاكر، وابحث عن أي تذكرة تخص نقص قطع غيار، تأخير شحن، خلل تقني أثناء العمل، تشخيص إضافي اكتُشف أثناء التنفيذ، أو نقل السيارة لمركز آخر):
-    {json.dumps(order_data.get('tickets'), ensure_ascii=False, indent=2)}
-
-    2. 💬 محادثات الشات والتعليقات الداخلية — قارن مدة العمل الفعلية بمحتوى المتابعات: هل فيه تحديثات دورية من المركز تدل على عمل فعلي مستمر (صور تقدم، تحديث حالة، طلب قطعة)، أم فجوات صمت طويلة بدون أي تحديث تدل على تعطل حقيقي؟:
-    {json.dumps(order_data.get('comments'), ensure_ascii=False, indent=2)}
-
-    🔍 === سيناريوهات محتملة يجب فحصها (إلزامي) === 🔍
-    - هل التأخير بسبب انتظار توفر قطعة غيار (سواء من المورد، طلبية جديدة، أو نقص في المخزون)؟ → صنّف كـ"قطع الغيار" أو "قطع الغيار وطلبية" حسب السياق.
-    - هل هناك تأخير شحن قطعة تم طلبها بالفعل؟ → صنّف كـ"تأخير في الشحن".
-    - هل ظهر خلل تقني جديد أثناء التنفيذ يستلزم وقتًا إضافيًا لم يكن متوقعًا؟ → صنّف كـ"خلل تقني".
-    - هل اكتشف المركز أثناء العمل حاجة لتشخيص إضافي لم يظهر في الفحص الأول؟ → صنّف كـ"تشخيص إضافي".
-    - هل السبب الأساسي أن الفحص الأول كان خاطئًا وأدى لإعادة عمل أو تصحيح مسار؟ → صنّف كـ"تشخيص مركز خاطئ".
-    - هل تم نقل السيارة لمركز آخر أثناء التنفيذ؟ → صنّف كـ"نقل مركز آخر".
-    - هل هذا طلب عمل مكرر فعليًا لنفس المهمة؟ → صنّف كـ"مكرر".
-    - هل السيارة تم تسليمها فعليًا للعميل والحالة لم تُحدّث بعد في النظام؟ → صنّف كـ"تم التسليم".
-    - هل التأخير ناتج عن العميل نفسه (مثل عدم رده على استفسار ضروري لاستكمال العمل)؟ → صنّف كـ"عميل".
-    - 🕐 مهم: أي فجوة زمنية تقع كليًا أو جزئيًا خارج ساعات العمل الرسمية (9ص-6م) أو يوم الجمعة لا تُحتسب كتأخير من أي طرف. لو الجزء الأكبر من المدة وقع في هذا النطاق → صنّف كـ"يوم الجمعة" إن كان هو السبب الرئيسي.
-    - ⚠️ تذكّر: مدة طويلة مع تحديثات منتظمة من المركز في التعليقات تعني عملاً حقيقيًا مستمرًا وليست تأخيرًا، بغض النظر عن الرقم الإجمالي.
-
-    3. ⏱️ التسلسل الزمني الكامل للحالات (مرجعي فقط لفهم السياق العام للطلب):
-    {json.dumps(order_data.get('status_history'), ensure_ascii=False, indent=2)}
-
-    === 🎯 تعليمات وقواعد الصياغة الصارمة ===
-    قسّم إجابتك إلى ثلاثة أقسام يفصل بينها السطر `===SPLIT===` قبل القسم الثاني، والسطر `===CLASSIFICATION===` قبل القسم الثالث:
-
-    القسم الأول: [السبب الجذري المباشر]
-    - فقرة واحدة متصلة ومباشرة فقط (من 4 إلى 5 سطور كحد أقصى).
-    - 🟢 ابدأ الفقرة **فورًا** بذكر السبب الجذري نفسه (الطرف أو العامل المتسبب وماذا حدث بالضبط)، بدون أي مقدمات إطلاقًا.
-    - 🛑 ممنوع تمامًا افتتاح الفقرة بعبارات مثل "يعود السبب الجذري إلى" أو أي صياغة تمهيدية مشابهة.
-    - 🛑 ممنوع ذكر رقم الطلب نهائيًا في هذه الفقرة.
-    - 🛑 يُمنع استخدام جمل فضفاضة دون تحديد السبب الحقيقي من نص التذاكر أو الشات.
-    - يُمنع استخدام القوائم، العناوين، أو أرقام التذاكر والعروض الداخلية.
-
-    ===SPLIT===
-
-    القسم الثاني: [الأدلة والوقائع التفصيلية]
-    - التوقيت الدقيق لبداية (واستمرار أو انتهاء) مرحلة جاري العمل.
-    - اقتباس نصوص التذاكر والتعليقات ذات الصلة كلمة بكلمة.
-    - سرد أي فجوات صمت فعلية أو غياب تحديثات تدعم استنتاجك.
-    - أي ارتباط بقطع غيار، شحن، تشخيص إضافي، أو نقل بين مراكز إن وجد.
-
-    ===CLASSIFICATION===
-    - اكتب هنا تصنيفاً واحداً فقط (بالضبط كما هو، بدون أي شرح إضافي) من هذه القائمة الحصرية:
-      {" | ".join(WORK_CLASSIFICATIONS)}
-    - اختر التصنيف الأقرب لواقع الأدلة فقط، ولا تخترع تصنيفاً من عندك خارج هذه القائمة.
-    """
-
-    return call_gemini_with_fallback(api_key, prompt_text), last_status_note
-
-
-def call_gemini_with_fallback(api_key: str, prompt_text: str) -> str:
-    """
-    يجرب كل موديل في MODEL_FALLBACK_LIST بالترتيب، وبيعيد المحاولة على نفس الموديل
-    كذا مرة (بفاصل زمني) لو الخطأ 503 (زحمة مؤقتة) قبل ما ينتقل للموديل اللي بعده.
-    خطأ 401 (مصادقة) بيوقف فورًا لأنه مش هيتحل بتغيير الموديل.
-    """
-    attempt_errors = []
-
-    for model_name in MODEL_FALLBACK_LIST:
-        for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-            headers = {
-                'Content-Type': 'application/json',
-                'x-goog-api-key': api_key
-            }
-            data = {
-                "contents": [{"parts": [{"text": prompt_text}]}],
-                "generationConfig": {
-                    "temperature": 0.3,
-                    "topP": 0.9
-                }
-            }
-
-            try:
-                response = requests.post(url, headers=headers, json=data, timeout=60)
-            except requests.exceptions.RequestException as e:
-                attempt_errors.append(f"{model_name}: تعذر الوصول (مشكلة شبكة) — {str(e)}")
-                break
-
-            if response.status_code == 200:
-                result_json = response.json()
-                try:
-                    return result_json['candidates'][0]['content']['parts'][0]['text']
-                except (KeyError, IndexError):
-                    attempt_errors.append(
-                        f"{model_name}: رد بشكل غير متوقع (200 لكن بدون نص) — "
-                        f"{json.dumps(result_json, ensure_ascii=False)[:200]}"
-                    )
-                    break
-
-            elif response.status_code == 401:
-                raise Exception(
-                    "خطأ مصادقة (401): المفتاح غير صالح أو منتهي الصلاحية. "
-                    "اعمل مفتاح جديد من https://aistudio.google.com/app/apikey"
-                )
-
-            elif response.status_code == 503 and attempt < len(RETRY_DELAYS_SECONDS):
-                time.sleep(RETRY_DELAYS_SECONDS[attempt])
-                continue
-
-            else:
-                attempt_errors.append(
-                    f"{model_name}: خطأ {response.status_code} (بعد {attempt + 1} محاولة/محاولات) — "
-                    f"{response.text[:200]}"
-                )
-                break
-
-    raise Exception("فشلت كل الموديلات المتاحة:\n" + "\n".join(attempt_errors))
-
-
-with st.sidebar:
-    st.image("https://mismarapp.com/static/media/logo.f6cf70e4.svg", width=200)
-    st.markdown("### ⚙️ إعدادات النظام")
-
-    api_key_input = st.text_input(
-        "Gemini API Key",
-        value="",
-        type="password",
-        help="أدخل مفتاح الـ API الخاص بـ Gemini"
-    )
-
-    st.caption(
-        "🔁 الموديلات المستخدمة بالترتيب (فولباك تلقائي لو موديل مزدحم أو غير متاح): "
-        + " ← ".join(MODEL_FALLBACK_LIST)
-    )
-
-st.markdown("""
-<div class="mismar-header">
-    <h1>🛠️ نظام تدقيق تعطل جاري العمل (MisMar Work Delay Audit)</h1>
-    <p>استخراج السبب الجذري وراء تأخر تنفيذ الإصلاحات وتحديد الطرف أو العامل المتسبب</p>
-</div>
-""", unsafe_allow_html=True)
-
-col1, col2 = st.columns([1, 1], gap="large")
-
-with col1:
-    st.subheader("📋 بيانات الطلب")
-    order_id = st.number_input("رقم الطلب (Order ID)", value=1029480, step=1)
-    st.markdown("<br>", unsafe_allow_html=True)
-    analyze_btn = st.button("🚀 استخراج تبرير تعطل جاري العمل")
-
-with col2:
-    st.subheader("📊 مخرجات التقرير والتدقيق")
-
-    if analyze_btn:
-        if not api_key_input:
-            st.error("⚠️ يرجى إدخال Gemini API Key أولاً من القائمة الجانبية.")
-        else:
-            with st.spinner("⏳ جاري فحص أسباب تعطل مرحلة جاري العمل..."):
-                try:
-                    full_response, work_debug = analyze_work_delay(
-                        api_key_input, order_id
-                    )
-
-                    if "===CLASSIFICATION===" in full_response:
-                        main_part, classification = full_response.split("===CLASSIFICATION===", 1)
-                    else:
-                        main_part = full_response
-                        classification = "غير محدد"
-
-                    if "===SPLIT===" in main_part:
-                        justification, evidence = main_part.split("===SPLIT===", 1)
-                    else:
-                        justification = main_part
-                        evidence = "لم يتم تفكيك الأدلة بشكل منفصل."
-
-                    st.session_state['work_audit_result'] = {
-                        'justification': justification.strip(),
-                        'evidence': evidence.strip(),
-                        'classification': classification.strip(),
-                        'order_id': order_id,
-                        'work_debug': work_debug,
-                    }
-
-                except Exception as e:
-                    st.error(f"❌ حدث خطأ أثناء التحليل: {str(e)}")
-
-    if 'work_audit_result' in st.session_state and st.session_state['work_audit_result']:
-        res = st.session_state['work_audit_result']
-
-        safe_justification = html.escape(res["justification"])
-        safe_evidence = html.escape(res["evidence"])
-        safe_classification = html.escape(res.get("classification", "غير محدد"))
-
-        st.markdown(
-            f'<div style="display:inline-block; background:#14B8A6; color:#0B0F19; '
-            f'font-weight:800; padding:8px 18px; border-radius:999px; margin-bottom:14px; '
-            f'font-size:1.05rem;">🏷️ التصنيف النهائي: {safe_classification}</div>',
-            unsafe_allow_html=True
-        )
-
-        st.markdown("### 📝 التبرير التشغيلي لتعطل جاري العمل:")
-        st.markdown(f'<div class="justification-card">{safe_justification}</div>', unsafe_allow_html=True)
-
-        st.text_area("📋 اضغط Ctrl+A ثم Ctrl+C للنسخ المباشر:", value=res["justification"], height=120)
-
-        st.markdown("### 🔍 الأدلة والوقائع التفصيلية:")
-        st.markdown(f'<div class="evidence-card">{safe_evidence}</div>', unsafe_allow_html=True)
-
-        with st.expander("🛠️ (Debug) مدة حالة جاري العمل المحسوبة برمجيًا فعليًا"):
-            st.markdown(
-                "الأرقام دي محسوبة مباشرة بكود بايثون من التواريخ الخام (مش من الموديل)، "
-                "قارنها بالتقرير فوق للتأكد إن الموديل التزم بيها حرفيًا:"
-            )
-            st.text(res.get("work_debug", "لا توجد بيانات."))
-    elif not analyze_btn:
-        st.info("👈 قم بإدخال رقم الطلب والضغط على زر التحليل لعرض تبرير تعطل جاري العمل هنا.")
+// ====== تسجيل دخول Metabase برمجيًا والحصول على سيشن توكن صالح ======
+function getMetabaseSessionToken() {
+  if (_cachedSessionToken) return _cachedSessionToken;
+
+  var props = PropertiesService.getScriptProperties();
+  var username = props.getProperty('METABASE_USERNAME');
+  var password = props.getProperty('METABASE_PASSWORD');
+
+  if (!username || !password) {
+    throw new Error('محتاج تضبط بيانات دخول Metabase الأول من القائمة (يوزر نيم وباسورد).');
+  }
+
+  var response = UrlFetchApp.fetch(METABASE_BASE_URL + "/api/session", {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({ username: username, password: password }),
+    muteHttpExceptions: true
+  });
+
+  var code = response.getResponseCode();
+  if (code !== 200) {
+    throw new Error(
+      "فشل تسجيل الدخول لـ Metabase (كود " + code + "). " +
+      "تأكد من صحة اليوزر نيم والباسورد المحفوظين. الرد: " + response.getContentText().substring(0, 200)
+    );
+  }
+
+  var result = JSON.parse(response.getContentText());
+  _cachedSessionToken = result.id;
+  return _cachedSessionToken;
+}
+
+// ====== تحويل نتيجة استعلام Metabase (data.cols + data.rows) لمصفوفة كائنات ======
+function cardResultToObjects(queryResult) {
+  if (!queryResult || !queryResult.data || !queryResult.data.cols || !queryResult.data.rows) {
+    return [];
+  }
+  var colNames = queryResult.data.cols.map(function (c) { return c.name || c.display_name; });
+  return queryResult.data.rows.map(function (row) {
+    var obj = {};
+    colNames.forEach(function (name, i) { obj[name] = row[i]; });
+    return obj;
+  });
+}
+
+var WORK_STATUS_NAME = "جاري العمل";
+var WORK_CLASSIFICATIONS = [
+  "قطع الغيار", "التشغيل", "عميل", "مركز", "لا يوجد تأخير", "تأخير في الشحن",
+  "خلل تقني", "تم التسليم", "يوم الجمعة", "تشخيص إضافي", "مكرر",
+  "قطع الغيار والمركز", "نقل مركز آخر", "التشغيل والمركز", "قطع الغيار والتشغيل",
+  "قطع الغيار وطلبية", "تشخيص مركز خاطئ"
+];
+
+// ساعات العمل المعتبرة لمرحلة جاري العمل: 9 صباحًا - 6 مساءً
+var WORK_START_HOUR = 9;
+var WORK_END_HOUR = 18;
+var FRIDAY_DAY = 5; // في JavaScript: Date.getDay() الأحد=0 ... الجمعة=5 ... السبت=6
+
+// ====== القائمة المخصصة في الشيت ======
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('تدقيق مسمار')
+    .addItem('تشغيل التدقيق على الصفوف الجديدة', 'runPendingRowsFromMenu')
+    .addItem('إعادة تشغيل الصف الحالي بالقوة', 'forceRunCurrentRow')
+    .addSeparator()
+    .addItem('تفعيل التشغيل التلقائي (9:30 صباحًا يوميًا)', 'setupDailyTrigger')
+    .addItem('إيقاف التشغيل التلقائي', 'removeDailyTrigger')
+    .addSeparator()
+    .addItem('ضبط بيانات دخول Metabase', 'setMetabaseCredentials')
+    .addSeparator()
+    .addItem('ضبط مفتاح Gemini API', 'setApiKey')
+    .addToUi();
+}
+
+function setApiKey() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.prompt('أدخل مفتاح Gemini API:', ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() == ui.Button.OK) {
+    var key = response.getResponseText().trim();
+    PropertiesService.getScriptProperties().setProperty('GEMINI_API_KEY', key);
+    ui.alert('تم حفظ المفتاح بنجاح.');
+  }
+}
+
+// ====== إعداد/إلغاء التشغيل التلقائي اليومي ======
+function setupDailyTrigger() {
+  removeDailyTrigger(); // نمسح أي trigger قديم الأول عشان منعملش تكرار
+  ScriptApp.newTrigger('processAllPendingRows')
+    .timeBased()
+    .atHour(9)
+    .nearMinute(30)
+    .everyDays(1)
+    .create();
+  SpreadsheetApp.getUi().alert(
+    'تم تفعيل التشغيل التلقائي يوميًا في حدود الساعة 9:30 صباحًا.\n' +
+    'ملحوظة: Google Apps Script بيشغّل الـ trigger في أقرب وقت لـ9:30 مش بالثانية بالظبط، ' +
+    'فممكن يشتغل أي وقت بين 9:15 و9:45 تقريبًا حسب ضغط السيرفرات عند جوجل.'
+  );
+}
+
+function removeDailyTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(function (t) {
+    if (t.getHandlerFunction() === 'processAllPendingRows') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+// ====== استخراج رقم الطلب من رابط الطلب في العمود A ======
+function extractOrderIdFromText(text) {
+  if (!text) return null;
+  var str = String(text).trim();
+  var match = /\/orders\/(\d+)/.exec(str);
+  if (match) return match[1];
+  var parts = str.split('/');
+  var last = parts[parts.length - 1];
+  if (/^\d+$/.test(last)) return last;
+  return null;
+}
+
+function getOrderIdFromCell(cell) {
+  var value = cell.getValue();
+  var id = extractOrderIdFromText(value);
+  if (id) return id;
+  // احتياطي: لو الخلية HYPERLINK بنص عرض مختلف عن الرابط نفسه
+  try {
+    var richValue = cell.getRichTextValue();
+    if (richValue) {
+      id = extractOrderIdFromText(richValue.getLinkUrl());
+      if (id) return id;
+    }
+  } catch (e) {
+    // تجاهل، مفيش رابط غني في الخلية دي
+  }
+  return null;
+}
+
+// ====== النسخة اللي بتظهر تقرير للمستخدم (اربطها بزرار القائمة) ======
+function runPendingRowsFromMenu() {
+  var ui = SpreadsheetApp.getUi();
+  var summary;
+
+  try {
+    summary = processAllPendingRows();
+  } catch (e) {
+    ui.alert('خطأ: ' + e.message);
+    return;
+  }
+
+  if (summary.noApiKey) {
+    ui.alert('محتاج تضبط مفتاح Gemini API الأول من قائمة "تدقيق مسمار".');
+    return;
+  }
+
+  ui.alert(
+    'انتهى الفحص:\n' +
+    '✅ صفوف اتعملت: ' + summary.processed + '\n' +
+    '⏭️ صفوف اتقفزت (فاضية أو رقم طلب مش واضح أو معمولة قبل كده): ' + summary.skipped + '\n' +
+    '❌ صفوف فيها خطأ: ' + summary.errors + '\n' +
+    (summary.processed === 0 && summary.skipped > 0
+      ? '\n(كل الصفوف اتقفزت — لو ده غير متوقع، افتح الشيت اللي فيه بيانات فعلاً وشغّل من قائمته هو تحديدًا، مش من شيت تاني مفتوح).'
+      : '')
+  );
+}
+
+// ====== النسخة الأساسية (تستخدمها القائمة والتريجر التلقائي على السوا) ======
+// آمنة للتشغيل من التريجر لأنها مبتستخدمش SpreadsheetApp.getUi()
+function processAllPendingRows() {
+  var sheet = SpreadsheetApp.getActiveSheet();
+  var lastRow = sheet.getLastRow();
+  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+
+  var summary = { processed: 0, skipped: 0, errors: 0, noApiKey: false };
+
+  if (!apiKey) {
+    Logger.log('لا يوجد مفتاح Gemini API مضبوط.');
+    summary.noApiKey = true;
+    return summary;
+  }
+
+  // نتأكد من صلاحية تسجيل الدخول لـ Metabase قبل ما نبدأ أي صف، عشان
+  // منضيعش وقت في صفوف كتير هتفشل كلها بنفس السبب لو بيانات الدخول غلط
+  getMetabaseSessionToken();
+
+  for (var row = HEADER_ROWS + 1; row <= lastRow; row++) {
+    var justificationCell = sheet.getRange(row, COLUMNS.JUSTIFICATION);
+    var existing = justificationCell.getValue();
+    if (existing && String(existing).trim() !== '') {
+      summary.skipped++;
+      continue; // الصف ده اتعمل قبل كده
+    }
+
+    var orderIdCell = sheet.getRange(row, COLUMNS.ORDER_ID);
+    var orderId = getOrderIdFromCell(orderIdCell);
+    if (!orderId) {
+      summary.skipped++;
+      continue; // مفيش رابط طلب صالح في الصف ده
+    }
+
+    var ok = runSingleRow(sheet, row, orderId, apiKey);
+    if (ok) {
+      summary.processed++;
+    } else {
+      summary.errors++;
+    }
+  }
+
+  Logger.log(JSON.stringify(summary));
+  return summary;
+}
+
+// ====== إعادة تشغيل الصف الحالي بالقوة حتى لو معمول قبل كده ======
+function forceRunCurrentRow() {
+  var ui = SpreadsheetApp.getUi();
+  var sheet = SpreadsheetApp.getActiveSheet();
+  var row = sheet.getActiveCell().getRow();
+
+  if (row <= HEADER_ROWS) {
+    ui.alert('اختر صف فيه بيانات فعلية (مش صفوف العناوين) ثم حاول تاني.');
+    return;
+  }
+
+  var apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) {
+    ui.alert('محتاج تضبط مفتاح Gemini API الأول من قائمة "تدقيق مسمار".');
+    return;
+  }
+
+  var orderIdCell = sheet.getRange(row, COLUMNS.ORDER_ID);
+  var orderId = getOrderIdFromCell(orderIdCell);
+  if (!orderId) {
+    ui.alert('تعذر استخراج رقم طلب صالح من رابط هذا الصف. تأكد إنك واقف على صف فيه رابط طلب فعلي.');
+    return;
+  }
+
+  var ok = runSingleRow(sheet, row, orderId, apiKey);
+  ui.alert(ok ? 'تم تحديث الصف بنجاح.' : 'حصل خطأ أثناء التحليل — شوف عمود السبب الجذري لتفاصيل الخطأ.');
+}
+
+// ====== تشغيل التحليل لصف واحد وكتابة النتيجة في عمودي التبرير والتصنيف ======
+// بترجع true لو نجحت، false لو حصل خطأ
+function runSingleRow(sheet, row, orderId, apiKey) {
+  var justificationCell = sheet.getRange(row, COLUMNS.JUSTIFICATION);
+  justificationCell.setValue('جاري التحليل...');
+  SpreadsheetApp.flush();
+
+  try {
+    var fullResponse = analyzeWorkDelay(apiKey, orderId);
+
+    var classification = 'غير محدد';
+    var mainPart = fullResponse;
+    if (fullResponse.indexOf('===CLASSIFICATION===') !== -1) {
+      var parts = fullResponse.split('===CLASSIFICATION===');
+      mainPart = parts[0];
+      classification = parts[1].trim();
+    }
+
+    var justification = mainPart;
+    if (mainPart.indexOf('===SPLIT===') !== -1) {
+      justification = mainPart.split('===SPLIT===')[0].trim();
+    }
+
+    justificationCell.setValue(justification.trim());
+    sheet.getRange(row, COLUMNS.CLASSIFICATION).setValue(classification.trim());
+    return true;
+
+  } catch (e) {
+    justificationCell.setValue('خطأ: ' + e.message);
+    return false;
+  }
+}
+
+// ====== استعلام سؤال داخلي واحد في Metabase بالسيشن توكن + رقم الطلب كمتغير ======
+function fetchCardData(cardId, orderId, sessionToken) {
+  var url = METABASE_BASE_URL + "/api/card/" + cardId + "/query";
+  var parameters = [{
+    type: "number/=",
+    target: ["variable", ["template-tag", "order_id"]],
+    value: String(orderId)
+  }];
+
+  var response = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    headers: { "X-Metabase-Session": sessionToken },
+    payload: JSON.stringify({ parameters: parameters }),
+    muteHttpExceptions: true
+  });
+
+  var code = response.getResponseCode();
+  if (code !== 200) {
+    return "Error HTTP " + code + ": " + response.getContentText().substring(0, 200);
+  }
+
+  try {
+    var queryResult = JSON.parse(response.getContentText());
+    return cardResultToObjects(queryResult);
+  } catch (e) {
+    return "Error: Response wasn't valid JSON: " + response.getContentText().substring(0, 200);
+  }
+}
+
+// ====== جلب بيانات الطلب من Metabase (تذاكر + تعليقات + تسلسل الحالات) ======
+function fetchOrderData(orderId) {
+  var sessionToken = getMetabaseSessionToken();
+  var payload = {};
+
+  Object.keys(METABASE_CARD_IDS).forEach(function (key) {
+    try {
+      payload[key] = fetchCardData(METABASE_CARD_IDS[key], orderId, sessionToken);
+    } catch (e) {
+      payload[key] = "Error: " + e.message;
+    }
+  });
+
+  return payload;
+}
+
+// ====== تحليل تاريخ Metabase (مع تصحيح فرق التوقيت +3 ساعات) ======
+function parseDt(value) {
+  if (!value) return null;
+  var str = String(value).trim();
+  var match = /^(\d{4})-(\d{2})-(\d{2}) (\d{1,2}):(\d{2}) (AM|PM)$/i.exec(str);
+  if (!match) return null;
+
+  var year = parseInt(match[1], 10);
+  var month = parseInt(match[2], 10) - 1;
+  var day = parseInt(match[3], 10);
+  var hour = parseInt(match[4], 10);
+  var minute = parseInt(match[5], 10);
+  var ampm = match[6].toUpperCase();
+
+  if (ampm === 'PM' && hour !== 12) hour += 12;
+  if (ampm === 'AM' && hour === 12) hour = 0;
+
+  var dt = new Date(year, month, day, hour, minute, 0);
+  // ⚠️ Metabase بيرجّع التوقيت متأخر 3 ساعات عن التوقيت الفعلي بالسعودية
+  dt.setHours(dt.getHours() + 3);
+  return dt;
+}
+
+// ====== تنسيق المدة الزمنية بالعربي (أيام/ساعات/دقايق) ======
+function formatDuration(ms) {
+  var totalMinutes = Math.floor(ms / 60000);
+  var days = Math.floor(totalMinutes / (24 * 60));
+  var remMinutes = totalMinutes % (24 * 60);
+  var hours = Math.floor(remMinutes / 60);
+  var minutes = remMinutes % 60;
+  var parts = [];
+  if (days) parts.push(days + ' يوم');
+  if (hours) parts.push(hours + ' ساعة');
+  if (minutes || parts.length === 0) parts.push(minutes + ' دقيقة');
+  return parts.join(' و');
+}
+
+// ====== حساب ساعات العمل الفعلية بين تاريخين (9ص-6م، بدون يوم الجمعة) ======
+function businessHoursDurationMs(start, end) {
+  if (start >= end) return 0;
+  var totalMs = 0;
+  var current = new Date(start.getTime());
+
+  while (current < end) {
+    var dayWorkStart = new Date(current.getFullYear(), current.getMonth(), current.getDate(), WORK_START_HOUR, 0, 0);
+    var dayWorkEnd = new Date(current.getFullYear(), current.getMonth(), current.getDate(), WORK_END_HOUR, 0, 0);
+
+    if (current.getDay() !== FRIDAY_DAY) {
+      var segStart = current > dayWorkStart ? current : dayWorkStart;
+      var segEnd = end < dayWorkEnd ? end : dayWorkEnd;
+      if (segStart < segEnd) {
+        totalMs += (segEnd.getTime() - segStart.getTime());
+      }
+    }
+
+    current = new Date(current.getFullYear(), current.getMonth(), current.getDate() + 1, 0, 0, 0);
+  }
+  return totalMs;
+}
+
+// ====== حساب مدة *آخر* مرة دخل فيها الطلب حالة معينة (مش المجموع) ======
+function computeLastStatusDuration(statusHistory, statusName) {
+  if (!Array.isArray(statusHistory) || statusHistory.length === 0) return null;
+
+  var matches = [];
+  statusHistory.forEach(function (row) {
+    if (!row || typeof row !== 'object') return;
+    var rowStatus = row.Status_Name || row.status_name || row.status;
+    if (rowStatus !== statusName) return;
+
+    var openedRaw = row.Opened_At || row.opened_at || row.created_at;
+    var closedRaw = row.Closed_At || row.closed_at || row.ended_at;
+    var openedDt = parseDt(openedRaw);
+
+    var stillActive = !!(closedRaw && String(closedRaw).trim().toLowerCase() === 'currently active');
+    var closedDt = stillActive ? new Date() : parseDt(closedRaw);
+
+    if (openedDt && closedDt) {
+      matches.push({
+        opened: openedDt,
+        closed: closedDt,
+        durationMs: closedDt.getTime() - openedDt.getTime(),
+        businessMs: businessHoursDurationMs(openedDt, closedDt),
+        stillActive: stillActive
+      });
+    }
+  });
+
+  if (matches.length === 0) return null;
+  matches.sort(function (a, b) { return a.opened - b.opened; });
+  return matches[matches.length - 1];
+}
+
+// ====== التحليل الرئيسي: بناء البرومبت واستدعاء Gemini ======
+function analyzeWorkDelay(apiKey, orderId) {
+  var orderData = fetchOrderData(orderId);
+  var lastWorkStatus = computeLastStatusDuration(orderData.status_history, WORK_STATUS_NAME);
+
+  // 🛑 قصير الدائرة: لو أقل من 4 ساعات عمل فعلية، نرجّع "لا يوجد تأخير" من غير استدعاء الموديل
+  var NO_DELAY_THRESHOLD_HOURS = 4;
+  if (lastWorkStatus && !lastWorkStatus.stillActive) {
+    var businessHours = lastWorkStatus.businessMs / 3600000;
+    if (businessHours < NO_DELAY_THRESHOLD_HOURS) {
+      return (
+        "لا يوجد تأخير، حيث استغرقت مرحلة " + WORK_STATUS_NAME + " " +
+        formatDuration(lastWorkStatus.businessMs) + " ساعات عمل فعلية فقط، وهي مدة طبيعية." +
+        "\n===SPLIT===\n" +
+        "مدة حالة " + WORK_STATUS_NAME + " بساعات العمل الفعلية: " + formatDuration(lastWorkStatus.businessMs) +
+        " (من " + lastWorkStatus.opened + " إلى " + lastWorkStatus.closed + ")، " +
+        "وهي أقل من الحد الأدنى المعتبر تأخيرًا (4 ساعات عمل)." +
+        "\n===CLASSIFICATION===\nلا يوجد تأخير"
+      );
+    }
+  }
+
+  if (!lastWorkStatus) {
+    return (
+      "تعذر العثور على مرحلة جاري العمل واضحة في سجل حالات هذا الطلب." +
+      "\n===SPLIT===\nلا توجد بيانات كافية للتحليل." +
+      "\n===CLASSIFICATION===\nلا يوجد تأخير"
+    );
+  }
+
+  var lastStatusNote =
+    "⏱️ مدة *آخر* مرة دخل فيها الطلب حالة '" + WORK_STATUS_NAME + "':\n" +
+    "- المدة الخام (شاملة كل الأوقات): " + formatDuration(lastWorkStatus.durationMs) + "\n" +
+    "- مدة ساعات العمل الفعلية فقط (بعد استبعاد ما هو خارج 9ص-6م ويوم الجمعة): " +
+    formatDuration(lastWorkStatus.businessMs) +
+    (lastWorkStatus.stillActive ? " (لسه شغالة/جارية حتى الآن)" : "") +
+    "\nمن " + lastWorkStatus.opened + " إلى " + lastWorkStatus.closed + ".\n" +
+    "⚠️ تنبيه: هذا الرقم وحده لا يعني تلقائيًا وجود تأخير. افحص التذاكر والتعليقات أولاً " +
+    "لمعرفة هل هذا وقت عمل فعلي وتحديثات مستمرة، أم فجوة صمت وتعطل حقيقي.";
+
+  var promptText =
+    "أنت كبير مدققي العمليات في شركة صيانة السيارات (مسمار - MisMar).\n" +
+    "مطلوب تحديد السبب الجذري وراء التأخير (إن وجد) في آخر مرة دخل فيها الطلب رقم #" + orderId + " مرحلة \"" + WORK_STATUS_NAME + "\".\n\n" +
+    "⚠️ === الحقيقة الزمنية الحاسمة (إلزامية الاستخدام، ولا تحسب من عندك) === ⚠️\n" +
+    lastStatusNote + "\n\n" +
+    "البيانات المتاحة للطلب (التركيز الأساسي هنا على التذاكر والتعليقات):\n" +
+    "1. 🎫 تذاكر الشكاوى والمتابعة — المصدر الأهم هنا لمعرفة سبب تعطل التنفيذ:\n" +
+    JSON.stringify(orderData.tickets, null, 2) + "\n\n" +
+    "2. 💬 محادثات الشات والتعليقات الداخلية — قارن مدة العمل الفعلية بمحتوى المتابعات:\n" +
+    JSON.stringify(orderData.comments, null, 2) + "\n\n" +
+    "🔍 === سيناريوهات محتملة يجب فحصها (إلزامي) === 🔍\n" +
+    "- هل التأخير بسبب انتظار توفر قطعة غيار (سواء من المورد، طلبية جديدة، أو نقص في المخزون)؟ → صنّف كـ\"قطع الغيار\" أو \"قطع الغيار وطلبية\" حسب السياق.\n" +
+    "- هل هناك تأخير شحن قطعة تم طلبها بالفعل؟ → صنّف كـ\"تأخير في الشحن\".\n" +
+    "- هل ظهر خلل تقني جديد أثناء التنفيذ يستلزم وقتًا إضافيًا لم يكن متوقعًا؟ → صنّف كـ\"خلل تقني\".\n" +
+    "- هل اكتشف المركز أثناء العمل حاجة لتشخيص إضافي لم يظهر في الفحص الأول؟ → صنّف كـ\"تشخيص إضافي\".\n" +
+    "- هل السبب الأساسي أن الفحص الأول كان خاطئًا وأدى لإعادة عمل أو تصحيح مسار؟ → صنّف كـ\"تشخيص مركز خاطئ\".\n" +
+    "- هل تم نقل السيارة لمركز آخر أثناء التنفيذ؟ → صنّف كـ\"نقل مركز آخر\".\n" +
+    "- هل هذا طلب عمل مكرر فعليًا لنفس المهمة؟ → صنّف كـ\"مكرر\".\n" +
+    "- هل السيارة تم تسليمها فعليًا للعميل والحالة لم تُحدّث بعد في النظام؟ → صنّف كـ\"تم التسليم\".\n" +
+    "- هل التأخير ناتج عن العميل نفسه؟ → صنّف كـ\"عميل\".\n" +
+    "- 🕐 مهم: أي فجوة زمنية تقع كليًا أو جزئيًا خارج ساعات العمل الرسمية (9ص-6م) أو يوم الجمعة لا تُحتسب كتأخير من أي طرف. لو الجزء الأكبر من المدة وقع في هذا النطاق → صنّف كـ\"يوم الجمعة\" إن كان هو السبب الرئيسي.\n" +
+    "- ⚠️ تذكّر: مدة طويلة مع تحديثات منتظمة من المركز في التعليقات تعني عملاً حقيقيًا مستمرًا وليست تأخيرًا، بغض النظر عن الرقم الإجمالي.\n\n" +
+    "3. ⏱️ التسلسل الزمني الكامل للحالات (مرجعي فقط لفهم السياق العام للطلب):\n" +
+    JSON.stringify(orderData.status_history, null, 2) + "\n\n" +
+    "=== 🎯 تعليمات وقواعد الصياغة الصارمة ===\n" +
+    "قسّم إجابتك إلى ثلاثة أقسام يفصل بينها السطر `===SPLIT===` قبل القسم الثاني، والسطر `===CLASSIFICATION===` قبل القسم الثالث:\n\n" +
+    "القسم الأول: [السبب الجذري المباشر]\n" +
+    "- فقرة واحدة متصلة ومباشرة فقط (من 4 إلى 5 سطور كحد أقصى).\n" +
+    "- ابدأ الفقرة فورًا بذكر السبب الجذري نفسه، بدون أي مقدمات إطلاقًا.\n" +
+    "- ممنوع تمامًا افتتاح الفقرة بعبارات مثل \"يعود السبب الجذري إلى\".\n" +
+    "- ممنوع ذكر رقم الطلب نهائيًا في هذه الفقرة.\n" +
+    "- يُمنع استخدام جمل فضفاضة دون تحديد السبب الحقيقي من نص التذاكر أو الشات.\n" +
+    "- يُمنع استخدام القوائم أو العناوين أو أرقام التذاكر الداخلية.\n\n" +
+    "===SPLIT===\n\n" +
+    "القسم الثاني: [الأدلة والوقائع التفصيلية]\n" +
+    "- التوقيت الدقيق لبداية (واستمرار أو انتهاء) مرحلة جاري العمل.\n" +
+    "- اقتباس نصوص التذاكر والتعليقات ذات الصلة كلمة بكلمة.\n" +
+    "- سرد أي فجوات صمت فعلية أو غياب تحديثات تدعم استنتاجك.\n\n" +
+    "===CLASSIFICATION===\n" +
+    "- اكتب هنا تصنيفاً واحداً فقط (بالضبط كما هو، بدون أي شرح إضافي) من هذه القائمة الحصرية:\n" +
+    "  " + WORK_CLASSIFICATIONS.join(" | ") + "\n" +
+    "- اختر التصنيف الأقرب لواقع الأدلة فقط، ولا تخترع تصنيفاً من عندك خارج هذه القائمة.";
+
+  return callGeminiWithFallback(apiKey, promptText);
+}
+
+// ====== استدعاء Gemini مع تجربة موديلات بديلة تلقائيًا لو الأول مزدحم أو مش متاح ======
+function callGeminiWithFallback(apiKey, promptText) {
+  var attemptErrors = [];
+
+  for (var i = 0; i < MODEL_FALLBACK_LIST.length; i++) {
+    var modelName = MODEL_FALLBACK_LIST[i];
+    var url = "https://generativelanguage.googleapis.com/v1beta/models/" + modelName + ":generateContent";
+    var options = {
+      method: "post",
+      contentType: "application/json",
+      headers: { "x-goog-api-key": apiKey },
+      payload: JSON.stringify({
+        contents: [{ parts: [{ text: promptText }] }],
+        generationConfig: { temperature: 0.3, topP: 0.9 }
+      }),
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(url, options);
+    var code = response.getResponseCode();
+    var resultText = response.getContentText();
+
+    if (code === 200) {
+      var resultJson = JSON.parse(resultText);
+      try {
+        return resultJson.candidates[0].content.parts[0].text;
+      } catch (e) {
+        attemptErrors.push(modelName + ": رد بشكل غير متوقع (200 لكن بدون نص) — " + resultText.substring(0, 200));
+        continue;
+      }
+    } else if (code === 401) {
+      // خطأ مصادقة مش هيتحل بتغيير الموديل، نوقف فورًا من غير ما نكمل نجرب باقي القائمة
+      throw new Error("خطأ مصادقة (401): المفتاح غير صالح أو منتهي الصلاحية.");
+    } else {
+      // أي كود تاني (404/503/400/غيره) نسجله ونكمل نجرب الموديل اللي بعده
+      attemptErrors.push(modelName + ": خطأ " + code + " — " + resultText.substring(0, 200));
+      continue;
+    }
+  }
+
+  // لو خلصت القائمة كلها من غير نجاح، اعرض تفاصيل كل محاولة عشان يبقى التشخيص واضح
+  throw new Error("فشلت كل الموديلات المتاحة:\n" + attemptErrors.join("\n"));
+}
