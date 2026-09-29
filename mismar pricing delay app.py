@@ -2,7 +2,6 @@ import html
 import json
 import os
 import re
-import urllib.parse
 from datetime import datetime, timedelta
 import requests
 import streamlit as st
@@ -95,11 +94,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-METABASE_ENDPOINTS = {
-    "tickets": "https://analysis.mismarapp.com/public/question/5f313cbe-6bb4-43bc-9b4d-70b8de7d17d4.json",
-    "comments": "https://analysis.mismarapp.com/public/question/82aba25f-d368-44e3-8392-dce163d78e23.json",
-    "status_history": "https://analysis.mismarapp.com/public/question/98fe13e6-298a-4775-8244-3015c9c720fe.json",
-    "pricing": "https://analysis.mismarapp.com/public/question/b0114e1f-8577-4faa-a790-eaa2412f39f6.json"
+# ⚠️ الروابط العامة (public links) بتاعة Metabase اتلغت، فبقينا نسجّل دخول
+# برمجيًا بيوزر/باسورد حقيقيين (سيشن توكن)، ونستخدم أرقام الأسئلة الداخلية (Card ID) مباشرة
+METABASE_BASE_URL = "https://analysis.mismarapp.com"
+METABASE_CARD_IDS = {
+    "tickets": 15395,
+    "comments": 15394,
+    "status_history": 15393,
+    # 👇 حط هنا رقم كارت التسعير (الرقم اللي في رابط السؤال في Metabase: /question/رقم-اسم)
+    # أو ضعه في Streamlit Secrets باسم PRICING_CARD_ID بدل ما تعدل الكود
+    "pricing": None,
 }
 
 # التصنيفات المسموح بها حصريًا للنتيجة النهائية لتأخير التسعير
@@ -114,8 +118,51 @@ WORK_END_HOUR = 18
 FRIDAY_WEEKDAY = 4  # في بايثون: الإثنين=0 ... الجمعة=4 ... الأحد=6
 
 
-def build_metabase_url(base_url: str, order_id: int) -> str:
-    """يبني رابط الطلب بالصيغة الرسمية اللي Metabase محتاجها لتمرير قيمة لمتغير SQL اسمه order_id"""
+def get_secret(name: str, sidebar_value: str = "") -> str:
+    """يقرأ القيمة من الشريط الجانبي لو مكتوبة، وإلا من Streamlit Secrets"""
+    if sidebar_value:
+        return sidebar_value
+    try:
+        return str(st.secrets.get(name, ""))
+    except Exception:
+        return ""
+
+
+@st.cache_resource(ttl=6 * 3600, show_spinner=False)
+def get_metabase_session_token(username: str, password: str) -> str:
+    """تسجيل دخول Metabase برمجيًا والحصول على سيشن توكن صالح (بيتخزن مؤقتًا عشان منسجلش دخول مع كل طلب)"""
+    if not username or not password:
+        raise Exception("محتاج تدخل بيانات دخول Metabase (يوزر نيم وباسورد) الأول.")
+
+    response = requests.post(
+        f"{METABASE_BASE_URL}/api/session",
+        json={"username": username, "password": password},
+        timeout=30
+    )
+    if response.status_code != 200:
+        raise Exception(
+            f"فشل تسجيل الدخول لـ Metabase (كود {response.status_code}). "
+            f"تأكد من صحة اليوزر نيم والباسورد. الرد: {response.text[:200]}"
+        )
+    return response.json()["id"]
+
+
+def card_result_to_objects(query_result: dict) -> list:
+    """يحوّل نتيجة استعلام Metabase (data.cols + data.rows) لقائمة قواميس"""
+    if not isinstance(query_result, dict):
+        return []
+    data = query_result.get("data") or {}
+    cols = data.get("cols")
+    rows = data.get("rows")
+    if cols is None or rows is None:
+        return []
+    col_names = [c.get("name") or c.get("display_name") for c in cols]
+    return [dict(zip(col_names, row)) for row in rows]
+
+
+def fetch_card_data(card_id: int, order_id: int, session_token: str):
+    """يستعلم سؤال داخلي واحد في Metabase بالسيشن توكن، ويمرر رقم الطلب كمتغير order_id"""
+    url = f"{METABASE_BASE_URL}/api/card/{card_id}/query"
     parameters = [
         {
             "type": "number/=",
@@ -123,24 +170,36 @@ def build_metabase_url(base_url: str, order_id: int) -> str:
             "value": str(order_id)
         }
     ]
-    encoded_params = urllib.parse.quote(json.dumps(parameters))
-    return f"{base_url}?parameters={encoded_params}"
-
-
-def fetch_order_data(order_id: int) -> dict:
-    """جلب بيانات الطلب الكاملة من المصادر الأربعة في Metabase"""
-    payload = {}
-    for key, url in METABASE_ENDPOINTS.items():
+    res = requests.post(
+        url,
+        json={"parameters": parameters},
+        headers={"X-Metabase-Session": session_token},
+        timeout=60
+    )
+    if res.status_code in (200, 202):
         try:
-            full_url = build_metabase_url(url, order_id)
-            res = requests.get(full_url, timeout=15)
-            if res.status_code == 200:
-                try:
-                    payload[key] = res.json()
-                except ValueError:
-                    payload[key] = f"Error: Response wasn't valid JSON: {res.text[:200]}"
-            else:
-                payload[key] = f"Error HTTP {res.status_code}"
+            return card_result_to_objects(res.json())
+        except ValueError:
+            return f"Error: Response wasn't valid JSON: {res.text[:200]}"
+    return f"Error HTTP {res.status_code}: {res.text[:200]}"
+
+
+def fetch_order_data(order_id: int, mb_user: str, mb_pass: str, card_ids: dict) -> dict:
+    """جلب بيانات الطلب الكاملة من المصادر الأربعة في Metabase"""
+    session_token = get_metabase_session_token(mb_user, mb_pass)
+    payload = {}
+    for key, card_id in card_ids.items():
+        if not card_id:
+            payload[key] = f"Error: لم يتم ضبط رقم الكارت (Card ID) الخاص بـ '{key}'."
+            continue
+        try:
+            result = fetch_card_data(card_id, order_id, session_token)
+            # لو السيشن انتهت صلاحيتها (401)، نسجّل دخول من جديد ونعيد المحاولة مرة واحدة
+            if isinstance(result, str) and result.startswith("Error HTTP 401"):
+                get_metabase_session_token.clear()
+                session_token = get_metabase_session_token(mb_user, mb_pass)
+                result = fetch_card_data(card_id, order_id, session_token)
+            payload[key] = result
         except requests.exceptions.RequestException as e:
             payload[key] = f"Error: {str(e)}"
     return payload
@@ -314,9 +373,19 @@ def compute_pricing_cycles(pricing_data):
     return cycles, last_cycle, summary
 
 
-def analyze_pricing_delay(api_key: str, model_name: str, order_id: int):
+def analyze_pricing_delay(api_key: str, model_name: str, order_id: int, mb_user: str, mb_pass: str, card_ids: dict):
     """يرجع tuple: (نص رد الموديل, ملخص محسوب للتحقق منه في الواجهة)"""
-    order_data = fetch_order_data(order_id)
+    order_data = fetch_order_data(order_id, mb_user, mb_pass, card_ids)
+
+    # ملخص سريع للبيانات المسترجعة فعليًا من Metabase لهذا الطلب (للتأكد إنها بتتغير مع تغير الرقم)
+    summary_lines = []
+    for key, val in order_data.items():
+        if isinstance(val, list):
+            first = json.dumps(val[0], ensure_ascii=False, default=str)[:300] if val else "—"
+            summary_lines.append(f"[{key}] عدد الصفوف: {len(val)} | أول صف: {first}")
+        else:
+            summary_lines.append(f"[{key}] {str(val)[:300]}")
+    st.session_state['pricing_fetch_summary'] = "\n".join(summary_lines)
 
     # المصدر الرئيسي للمدة: آخر مرة دخل فيها الطلب حالة "جاري التسعير" في status_history
     last_pricing_status = compute_last_status_duration(order_data.get('status_history'), PRICING_STATUS_NAME)
@@ -484,7 +553,7 @@ with st.sidebar:
         "Gemini API Key",
         value="",
         type="password",
-        help="أدخل مفتاح الـ API الخاص بـ Gemini"
+        help="أدخل مفتاح الـ API الخاص بـ Gemini (أو ضعه في Secrets باسم GEMINI_API_KEY)"
     )
 
     model_name_input = st.text_input(
@@ -492,6 +561,33 @@ with st.sidebar:
         value="gemini-3.6-flash",
         help="غيّرها هنا لو ظهر خطأ 404 يفيد إن الموديل غير متاح، بدون الحاجة لتعديل الكود"
     )
+
+    mb_user_input = st.text_input(
+        "Metabase Username",
+        value="",
+        help="يوزر نيم/إيميل حساب Metabase (أو ضعه في Secrets باسم METABASE_USERNAME)"
+    )
+    mb_pass_input = st.text_input(
+        "Metabase Password",
+        value="",
+        type="password",
+        help="باسورد حساب Metabase (أو ضعه في Secrets باسم METABASE_PASSWORD)"
+    )
+    pricing_card_input = st.text_input(
+        "Pricing Card ID",
+        value="",
+        help="رقم كارت التسعير في Metabase (أو ضعه في Secrets باسم PRICING_CARD_ID)"
+    )
+
+api_key = get_secret("GEMINI_API_KEY", api_key_input)
+mb_user = get_secret("METABASE_USERNAME", mb_user_input)
+mb_pass = get_secret("METABASE_PASSWORD", mb_pass_input)
+
+# رقم كارت التسعير: من الشريط الجانبي، أو Secrets، أو القيمة الثابتة في أعلى الملف
+_pricing_card_raw = get_secret("PRICING_CARD_ID", pricing_card_input)
+card_ids = dict(METABASE_CARD_IDS)
+if _pricing_card_raw.strip().isdigit():
+    card_ids["pricing"] = int(_pricing_card_raw.strip())
 
 st.markdown("""
 <div class="mismar-header">
@@ -512,13 +608,19 @@ with col2:
     st.subheader("📊 مخرجات التقرير والتدقيق")
 
     if analyze_btn:
-        if not api_key_input:
-            st.error("⚠️ يرجى إدخال Gemini API Key أولاً من القائمة الجانبية.")
+        if not api_key:
+            st.error("⚠️ يرجى إدخال Gemini API Key أولاً (من القائمة الجانبية أو Secrets).")
+        elif not mb_user or not mb_pass:
+            st.error("⚠️ يرجى إدخال بيانات دخول Metabase (يوزر نيم وباسورد) أولاً.")
         else:
+            # نمسح النتيجة القديمة الأول عشان مهما حصل ما تفضلش معروضة نتيجة طلب تاني
+            st.session_state.pop('pricing_audit_result', None)
+            if not card_ids.get("pricing"):
+                st.warning("⚠️ رقم كارت التسعير (Pricing Card ID) مش مضبوط، فبيانات التسعير هتطلع فاضية في التحليل.")
             with st.spinner("⏳ جاري فحص أسباب تعطل دورة التسعير..."):
                 try:
                     full_response, pricing_debug = analyze_pricing_delay(
-                        api_key_input, model_name_input, order_id
+                        api_key, model_name_input, order_id, mb_user, mb_pass, card_ids
                     )
 
                     if "===CLASSIFICATION===" in full_response:
@@ -539,6 +641,7 @@ with col2:
                         'classification': classification.strip(),
                         'order_id': order_id,
                         'pricing_debug': pricing_debug,
+                        'fetch_summary': st.session_state.get('pricing_fetch_summary', ''),
                     }
 
                 except Exception as e:
@@ -546,6 +649,14 @@ with col2:
 
     if 'pricing_audit_result' in st.session_state and st.session_state['pricing_audit_result']:
         res = st.session_state['pricing_audit_result']
+
+        if int(res.get("order_id", 0)) != int(order_id):
+            st.warning(
+                f"⚠️ النتيجة المعروضة دي للطلب #{int(res['order_id'])} — "
+                f"الرقم الحالي #{int(order_id)}. اضغط زر التحليل عشان تجيب نتيجته."
+            )
+        else:
+            st.caption(f"نتيجة الطلب #{int(res['order_id'])}")
 
         safe_justification = html.escape(res["justification"])
         safe_evidence = html.escape(res["evidence"])
@@ -572,5 +683,7 @@ with col2:
                 "قارنها بالتقرير فوق للتأكد إن الموديل التزم بيها حرفيًا:"
             )
             st.text(res.get("pricing_debug", "لا توجد بيانات."))
+            st.markdown("**البيانات الخام اللي رجعت من Metabase لهذا الطلب:**")
+            st.text(res.get("fetch_summary", "لا توجد بيانات."))
     elif not analyze_btn:
         st.info("👈 قم بإدخال رقم الطلب والضغط على زر التحليل لعرض تبرير تعطل التسعير هنا.")
