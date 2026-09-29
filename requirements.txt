@@ -1,5 +1,2 @@
 streamlit
 requests
-pandas
-openpyxl
-gspread
