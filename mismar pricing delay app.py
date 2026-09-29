@@ -2,9 +2,14 @@ import html
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta
 import requests
 import streamlit as st
+
+# قائمة الموديلات بالترتيب: لو الأول مزدحم (503) أو مش موجود (404)، الكود يجرب اللي بعده تلقائيًا
+MODEL_FALLBACK_LIST = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash"]
+RETRY_DELAYS_SECONDS = [4, 10]  # نجرب نفس الموديل 3 مرات إجمالي (محاولة أولى + محاولتين إعادة) قبل الانتقال للموديل التالي
 
 # إعدادات الصفحة الرسمية لمسمار
 st.set_page_config(
@@ -101,8 +106,8 @@ METABASE_CARD_IDS = {
     "tickets": 15395,
     "comments": 15394,
     "status_history": 15393,
-    # 👇 حط هنا رقم كارت التسعير (الرقم اللي في رابط السؤال في Metabase: /question/رقم-اسم)
-    # أو ضعه في Streamlit Secrets باسم PRICING_CARD_ID بدل ما تعدل الكود
+    # لو سبتها None الكود بيدور على كارت التسعير تلقائيًا بعد تسجيل الدخول.
+    # ولو عايز تثبّت الرقم (أضمن)، حطه هنا: الرقم اللي في رابط السؤال /question/رقم-اسم
     "pricing": None,
 }
 
@@ -184,9 +189,40 @@ def fetch_card_data(card_id: int, order_id: int, session_token: str):
     return f"Error HTTP {res.status_code}: {res.text[:200]}"
 
 
+def find_pricing_card_id(session_token: str):
+    """
+    بيدور على كارت التسعير تلقائيًا بين كروت Metabase (بيدور على الكارت اللي استعلامه
+    فيه Quotation_Created_At و Request_Created_At و order_id). بيخزن الرقم بعد ما يلاقيه.
+    """
+    cached = st.session_state.get('pricing_card_id_cache')
+    if cached:
+        return cached
+    try:
+        res = requests.get(
+            f"{METABASE_BASE_URL}/api/card",
+            headers={"X-Metabase-Session": session_token},
+            timeout=90
+        )
+        if res.status_code != 200:
+            return None
+        for card in res.json():
+            if card.get("archived"):
+                continue
+            blob = json.dumps(card.get("dataset_query") or {}, ensure_ascii=False).lower()
+            if ("quotation_created_at" in blob and "request_created_at" in blob and "order_id" in blob):
+                st.session_state['pricing_card_id_cache'] = card.get("id")
+                return card.get("id")
+    except Exception:
+        return None
+    return None
+
+
 def fetch_order_data(order_id: int, mb_user: str, mb_pass: str, card_ids: dict) -> dict:
     """جلب بيانات الطلب الكاملة من المصادر الأربعة في Metabase"""
     session_token = get_metabase_session_token(mb_user, mb_pass)
+    card_ids = dict(card_ids)
+    if not card_ids.get("pricing"):
+        card_ids["pricing"] = find_pricing_card_id(session_token)
     payload = {}
     for key, card_id in card_ids.items():
         if not card_id:
@@ -373,7 +409,7 @@ def compute_pricing_cycles(pricing_data):
     return cycles, last_cycle, summary
 
 
-def analyze_pricing_delay(api_key: str, model_name: str, order_id: int, mb_user: str, mb_pass: str, card_ids: dict):
+def analyze_pricing_delay(api_key: str, order_id: int, mb_user: str, mb_pass: str, card_ids: dict):
     """يرجع tuple: (نص رد الموديل, ملخص محسوب للتحقق منه في الواجهة)"""
     order_data = fetch_order_data(order_id, mb_user, mb_pass, card_ids)
 
@@ -499,51 +535,67 @@ def analyze_pricing_delay(api_key: str, model_name: str, order_id: int, mb_user:
     - اختر التصنيف الأقرب لواقع الأدلة فقط، ولا تخترع تصنيفاً من عندك خارج هذه القائمة.
     """
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-    headers = {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': api_key
-    }
-    data = {
-        "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {
-            "temperature": 0.3,
-            "topP": 0.9
-        }
-    }
+    return call_gemini_with_fallback(api_key, prompt_text), combined_debug
 
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=60)
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"تعذر الوصول إلى خدمة Gemini (مشكلة شبكة): {str(e)}")
 
-    if response.status_code == 200:
-        result_json = response.json()
-        try:
-            model_text = result_json['candidates'][0]['content']['parts'][0]['text']
-            return model_text, combined_debug
-        except (KeyError, IndexError):
-            raise Exception(
-                "الاتصال نجح لكن شكل الرد غير متوقع (على الأرجح تم حظر المحتوى أو انتهت الحصة/الـ quota). "
-                f"الرد الكامل: {json.dumps(result_json, ensure_ascii=False)[:800]}"
-            )
-    elif response.status_code == 401:
-        raise Exception(
-            "خطأ مصادقة (401): المفتاح غير صالح أو منتهي الصلاحية. "
-            "اعمل مفتاح جديد من https://aistudio.google.com/app/apikey"
-        )
-    elif response.status_code == 404:
-        raise Exception(
-            f"اسم الموديل '{model_name}' غير موجود أو غير متاح لحسابك (404). "
-            "جرّب اسم موديل آخر من صفحة الموديلات المتاحة في حسابك."
-        )
-    elif response.status_code == 503:
-        raise Exception(
-            "خطأ 503: الموديل مزدحم مؤقتًا من عند Google، جرب تاني بعد شوية أو غيّر اسم الموديل مؤقتًا."
-        )
-    else:
-        raise Exception(f"خطأ في الاتصال بالذكاء الاصطناعي ({response.status_code}): {response.text}")
+def call_gemini_with_fallback(api_key: str, prompt_text: str) -> str:
+    """
+    يجرب كل موديل في MODEL_FALLBACK_LIST بالترتيب، وبيعيد المحاولة على نفس الموديل
+    كذا مرة (بفاصل زمني) لو الخطأ 503 (زحمة مؤقتة) قبل ما ينتقل للموديل اللي بعده.
+    خطأ 401 (مصادقة) بيوقف فورًا لأنه مش هيتحل بتغيير الموديل.
+    """
+    attempt_errors = []
 
+    for model_name in MODEL_FALLBACK_LIST:
+        for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            headers = {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': api_key
+            }
+            data = {
+                "contents": [{"parts": [{"text": prompt_text}]}],
+                "generationConfig": {
+                    "temperature": 0.3,
+                    "topP": 0.9
+                }
+            }
+
+            try:
+                response = requests.post(url, headers=headers, json=data, timeout=60)
+            except requests.exceptions.RequestException as e:
+                attempt_errors.append(f"{model_name}: تعذر الوصول (مشكلة شبكة) — {str(e)}")
+                break
+
+            if response.status_code == 200:
+                result_json = response.json()
+                try:
+                    return result_json['candidates'][0]['content']['parts'][0]['text']
+                except (KeyError, IndexError):
+                    attempt_errors.append(
+                        f"{model_name}: رد بشكل غير متوقع (200 لكن بدون نص) — "
+                        f"{json.dumps(result_json, ensure_ascii=False)[:200]}"
+                    )
+                    break
+
+            elif response.status_code == 401:
+                raise Exception(
+                    "خطأ مصادقة (401): المفتاح غير صالح أو منتهي الصلاحية. "
+                    "اعمل مفتاح جديد من https://aistudio.google.com/app/apikey"
+                )
+
+            elif response.status_code == 503 and attempt < len(RETRY_DELAYS_SECONDS):
+                time.sleep(RETRY_DELAYS_SECONDS[attempt])
+                continue
+
+            else:
+                attempt_errors.append(
+                    f"{model_name}: خطأ {response.status_code} (بعد {attempt + 1} محاولة/محاولات) — "
+                    f"{response.text[:200]}"
+                )
+                break
+
+    raise Exception("فشلت كل الموديلات المتاحة:\n" + "\n".join(attempt_errors))
 
 with st.sidebar:
     st.image("https://mismarapp.com/static/media/logo.f6cf70e4.svg", width=200)
@@ -554,12 +606,6 @@ with st.sidebar:
         value="",
         type="password",
         help="أدخل مفتاح الـ API الخاص بـ Gemini (أو ضعه في Secrets باسم GEMINI_API_KEY)"
-    )
-
-    model_name_input = st.text_input(
-        "اسم الموديل (Model Name)",
-        value="gemini-3.6-flash",
-        help="غيّرها هنا لو ظهر خطأ 404 يفيد إن الموديل غير متاح، بدون الحاجة لتعديل الكود"
     )
 
     mb_user_input = st.text_input(
@@ -573,18 +619,18 @@ with st.sidebar:
         type="password",
         help="باسورد حساب Metabase (أو ضعه في Secrets باسم METABASE_PASSWORD)"
     )
-    pricing_card_input = st.text_input(
-        "Pricing Card ID",
-        value="",
-        help="رقم كارت التسعير في Metabase (أو ضعه في Secrets باسم PRICING_CARD_ID)"
+
+    st.caption(
+        "🔁 الموديلات المستخدمة بالترتيب (فولباك تلقائي لو موديل مزدحم أو غير متاح): "
+        + " ← ".join(MODEL_FALLBACK_LIST)
     )
 
 api_key = get_secret("GEMINI_API_KEY", api_key_input)
 mb_user = get_secret("METABASE_USERNAME", mb_user_input)
 mb_pass = get_secret("METABASE_PASSWORD", mb_pass_input)
 
-# رقم كارت التسعير: من الشريط الجانبي، أو Secrets، أو القيمة الثابتة في أعلى الملف
-_pricing_card_raw = get_secret("PRICING_CARD_ID", pricing_card_input)
+# رقم كارت التسعير: من Secrets (اختياري) أو القيمة الثابتة في أعلى الملف، وإلا بيتدوّر عليه تلقائيًا
+_pricing_card_raw = get_secret("PRICING_CARD_ID")
 card_ids = dict(METABASE_CARD_IDS)
 if _pricing_card_raw.strip().isdigit():
     card_ids["pricing"] = int(_pricing_card_raw.strip())
@@ -615,12 +661,10 @@ with col2:
         else:
             # نمسح النتيجة القديمة الأول عشان مهما حصل ما تفضلش معروضة نتيجة طلب تاني
             st.session_state.pop('pricing_audit_result', None)
-            if not card_ids.get("pricing"):
-                st.warning("⚠️ رقم كارت التسعير (Pricing Card ID) مش مضبوط، فبيانات التسعير هتطلع فاضية في التحليل.")
             with st.spinner("⏳ جاري فحص أسباب تعطل دورة التسعير..."):
                 try:
                     full_response, pricing_debug = analyze_pricing_delay(
-                        api_key, model_name_input, order_id, mb_user, mb_pass, card_ids
+                        api_key, order_id, mb_user, mb_pass, card_ids
                     )
 
                     if "===CLASSIFICATION===" in full_response:
