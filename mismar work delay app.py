@@ -307,6 +307,17 @@ def compute_last_status_duration(status_history, status_name):
 def analyze_work_delay(api_key: str, order_id: int, mb_user: str, mb_pass: str):
     """يرجع tuple: (نص رد الموديل, ملخص محسوب للتحقق منه في الواجهة)"""
     order_data = fetch_order_data(order_id, mb_user, mb_pass)
+
+    # ملخص سريع للبيانات المسترجعة فعليًا من Metabase لهذا الطلب (للتأكد إنها بتتغير مع تغير الرقم)
+    summary_lines = []
+    for key, val in order_data.items():
+        if isinstance(val, list):
+            first = json.dumps(val[0], ensure_ascii=False, default=str)[:300] if val else "—"
+            summary_lines.append(f"[{key}] عدد الصفوف: {len(val)} | أول صف: {first}")
+        else:
+            summary_lines.append(f"[{key}] {str(val)[:300]}")
+    st.session_state['last_fetch_summary'] = "\n".join(summary_lines)
+
     last_work_status = compute_last_status_duration(order_data.get('status_history'), WORK_STATUS_NAME)
 
     # 🛑 قصير الدائرة: لو آخر مرة دخل فيها الطلب حالة "جاري العمل" كانت أقل من 4 ساعات
@@ -543,6 +554,8 @@ with col2:
         elif not mb_user or not mb_pass:
             st.error("⚠️ يرجى إدخال بيانات دخول Metabase (يوزر نيم وباسورد) أولاً.")
         else:
+            # نمسح النتيجة القديمة الأول عشان مهما حصل ما تفضلش معروضة نتيجة طلب تاني
+            st.session_state.pop('work_audit_result', None)
             with st.spinner("⏳ جاري فحص أسباب تعطل مرحلة جاري العمل..."):
                 try:
                     full_response, work_debug = analyze_work_delay(
@@ -567,6 +580,7 @@ with col2:
                         'classification': classification.strip(),
                         'order_id': order_id,
                         'work_debug': work_debug,
+                        'fetch_summary': st.session_state.get('last_fetch_summary', ''),
                     }
 
                 except Exception as e:
@@ -574,6 +588,14 @@ with col2:
 
     if 'work_audit_result' in st.session_state and st.session_state['work_audit_result']:
         res = st.session_state['work_audit_result']
+
+        if int(res.get("order_id", 0)) != int(order_id):
+            st.warning(
+                f"⚠️ النتيجة المعروضة دي للطلب #{int(res['order_id'])} — "
+                f"الرقم الحالي #{int(order_id)}. اضغط زر التحليل عشان تجيب نتيجته."
+            )
+        else:
+            st.caption(f"نتيجة الطلب #{int(res['order_id'])}")
 
         safe_justification = html.escape(res["justification"])
         safe_evidence = html.escape(res["evidence"])
@@ -600,5 +622,7 @@ with col2:
                 "قارنها بالتقرير فوق للتأكد إن الموديل التزم بيها حرفيًا:"
             )
             st.text(res.get("work_debug", "لا توجد بيانات."))
+            st.markdown("**البيانات الخام اللي رجعت من Metabase لهذا الطلب:**")
+            st.text(res.get("fetch_summary", "لا توجد بيانات."))
     elif not analyze_btn:
         st.info("👈 قم بإدخال رقم الطلب والضغط على زر التحليل لعرض تبرير تعطل جاري العمل هنا.")
