@@ -150,7 +150,7 @@ def card_result_to_objects(query_result: dict) -> list:
 
 
 def fetch_card_data(card_id: int, order_id: int, session_token: str):
-    """يستعلم سؤال داخلي واحد في Metabase بالسيشن توكن ورقم الطلب كمتغير"""
+    """يستعلم سؤال داخلي واحد في Metabase، ويعيد المحاولة لو الرد 202 (لسه بيتنفذ)"""
     parameters = [
         {
             "type": "number/=",
@@ -158,23 +158,44 @@ def fetch_card_data(card_id: int, order_id: int, session_token: str):
             "value": str(order_id)
         }
     ]
-    try:
-        res = requests.post(
-            f"{METABASE_BASE_URL}/api/card/{card_id}/query",
-            headers={"X-Metabase-Session": session_token},
-            json={"parameters": parameters},
-            timeout=15
-        )
-    except requests.exceptions.RequestException as e:
-        return f"Error: {str(e)}"
 
-    if res.status_code != 200:
+    last_status = None
+    for attempt in range(4):  # 1 + 3 إعادة محاولة
+        try:
+            res = requests.post(
+                f"{METABASE_BASE_URL}/api/card/{card_id}/query",
+                headers={"X-Metabase-Session": session_token},
+                json={"parameters": parameters},
+                timeout=60  # الاستعلامات التقيلة ممكن تاخد وقت أكتر من 15 ثانية
+            )
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
+
+        last_status = res.status_code
+
+        if res.status_code in (200, 202):
+            try:
+                body = res.json()
+            except ValueError:
+                return f"Error: Response wasn't valid JSON: {res.text[:200]}"
+
+            # Metabase ساعات يرجّع 200/202 وجواه خطأ أو حالة لسه شغالة
+            if isinstance(body, dict):
+                if body.get("error"):
+                    return f"Error (Metabase query): {str(body['error'])[:300]}"
+                if body.get("status") == "failed":
+                    return f"Error (Metabase failed): {str(body)[:300]}"
+                data = body.get("data")
+                if isinstance(data, dict) and data.get("rows") is not None:
+                    return card_result_to_objects(body)
+
+            # 202 أو مفيش data لسه → نستنى ونعيد
+            time.sleep(3)
+            continue
+
         return f"Error HTTP {res.status_code}: {res.text[:200]}"
 
-    try:
-        return card_result_to_objects(res.json())
-    except ValueError:
-        return f"Error: Response wasn't valid JSON: {res.text[:200]}"
+    return f"Error: الاستعلام لسه ما رجعش بيانات بعد عدة محاولات (آخر كود {last_status})"
 
 
 def fetch_order_data(order_id: int, session_token: str) -> dict:
@@ -377,6 +398,15 @@ def analyze_diagnosis_delay(api_key: str, metabase_username: str, metabase_passw
     """يرجع tuple: (نص رد الموديل, الحقائق الزمنية المحسوبة للتحقق منها في الواجهة)"""
     session_token = get_metabase_session_token(metabase_username, metabase_password)
     order_data = fetch_order_data(order_id, session_token)
+
+    # 🛑 لو أي مصدر فشل جلبه، نوقف التحليل فورًا بدل ما نبعت "Error..." للموديل كأنه بيانات
+    failed = [k for k, v in order_data.items() if isinstance(v, str) and v.startswith("Error")]
+    if failed:
+        raise Exception(
+            f"فشل جلب البيانات من Metabase للمصادر: {', '.join(failed)}\n"
+            + "\n".join(f"{k}: {order_data[k]}" for k in failed)
+        )
+
     timeline_facts = compute_timeline_facts(order_data.get('status_history'))
     last_diagnosis = compute_last_diagnosis_duration(order_data.get('status_history'))
 
@@ -415,7 +445,7 @@ def analyze_diagnosis_delay(api_key: str, metabase_username: str, metabase_passw
     prompt_text = f"""
     أنت كبير مدققي العمليات في شركة صيانة السيارات (مسمار - MisMar).
     الطلب رقم #{order_id} تحت الفحص بخصوص التأخير في مرحلة "{DIAGNOSIS_STATUS_NAME}".
-    وظيفتك تحديد السبب الجذر الحقيقي وراء طول *آخر محاولة فحص وتشخيص فقط* (وليس تاريخ الفحص الكامل للطلب لو تكرر أكثر من مرة).
+    وظيفتك تحديد السبب الجذري الحقيقي وراء طول *آخر محاولة فحص وتشخيص فقط* (وليس تاريخ الفحص الكامل للطلب لو تكرر أكثر من مرة).
 
     ⚠️ === الحقيقة الزمنية الحاسمة (إلزامية الاستخدام، ولا تحسب من عندك) === ⚠️
     {last_diagnosis_summary}
