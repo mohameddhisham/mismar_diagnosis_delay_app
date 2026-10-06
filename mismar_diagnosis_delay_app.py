@@ -100,23 +100,57 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-METABASE_ENDPOINTS = {
-    "tickets": "https://analysis.mismarapp.com/public/question/5f313cbe-6bb4-43bc-9b4d-70b8de7d17d4.json",
-    "comments": "https://analysis.mismarapp.com/public/question/82aba25f-d368-44e3-8392-dce163d78e23.json",
-    "status_history": "https://analysis.mismarapp.com/public/question/98fe13e6-298a-4775-8244-3015c9c720fe.json",
-    "pricing": "https://analysis.mismarapp.com/public/question/b0114e1f-8577-4faa-a790-eaa2412f39f6.json"
+# ⚠️ الروابط العامة (Public Links) بتاعة Metabase اتلغت، فبقينا نسجّل دخول
+# برمجيًا بيوزر نيم وباسورد حقيقيين، ونستخدم أرقام الأسئلة الداخلية (Card ID) مباشرة
+METABASE_BASE_URL = "https://analysis.mismarapp.com"
+METABASE_CARD_IDS = {
+    "tickets": 15395,
+    "comments": 15394,
+    "status_history": 15393,
+    "pricing": 15392
 }
 
 # اسم الحالة بالظبط زي ما بيرجع من status_history، مستخدم في تمييز مرحلة الفحص والتشخيص عن باقي المراحل
 DIAGNOSIS_STATUS_NAME = "جاري الفحص والتشخيص"
 
 
-def build_metabase_url(base_url: str, order_id: int) -> str:
+def get_metabase_session_token(username: str, password: str) -> str:
+    """يسجّل دخول Metabase برمجيًا بيوزر/باسورد حقيقيين ويرجع سيشن توكن صالح"""
+    try:
+        res = requests.post(
+            f"{METABASE_BASE_URL}/api/session",
+            json={"username": username, "password": password},
+            timeout=15
+        )
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"تعذر الوصول إلى Metabase (مشكلة شبكة): {str(e)}")
+
+    if res.status_code != 200:
+        raise Exception(
+            f"فشل تسجيل الدخول لـ Metabase (كود {res.status_code}). "
+            f"تأكد من صحة اليوزر نيم والباسورد. الرد: {res.text[:200]}"
+        )
+
+    return res.json()["id"]
+
+
+def card_result_to_objects(query_result: dict) -> list:
     """
-    يبني رابط الطلب بالصيغة الرسمية اللي Metabase محتاجها لتمرير قيمة
-    لمتغير SQL (template-tag) اسمه order_id، بدل ?order_id=123 البسيطة
-    اللي مبتشتغلش مع أسئلة SQL فيها متغيرات مطلوبة (Required Variables).
+    يحوّل شكل رد Metabase لاستعلام سؤال داخلي (data.cols + data.rows منفصلين)
+    لنفس شكل البيانات القديم (قائمة dict لكل صف)، عشان باقي الكود يفضل شغال
+    من غير أي تعديل في منطق القراءة (row.get("Status_Name") وهكذا).
     """
+    data = query_result.get("data", {})
+    cols = data.get("cols", [])
+    rows = data.get("rows", [])
+    if not cols or not rows:
+        return []
+    col_names = [c.get("name") or c.get("display_name") for c in cols]
+    return [dict(zip(col_names, row)) for row in rows]
+
+
+def fetch_card_data(card_id: int, order_id: int, session_token: str):
+    """يستعلم سؤال داخلي واحد في Metabase بالسيشن توكن ورقم الطلب كمتغير"""
     parameters = [
         {
             "type": "number/=",
@@ -124,26 +158,30 @@ def build_metabase_url(base_url: str, order_id: int) -> str:
             "value": str(order_id)
         }
     ]
-    encoded_params = urllib.parse.quote(json.dumps(parameters))
-    return f"{base_url}?parameters={encoded_params}"
+    try:
+        res = requests.post(
+            f"{METABASE_BASE_URL}/api/card/{card_id}/query",
+            headers={"X-Metabase-Session": session_token},
+            json={"parameters": parameters},
+            timeout=15
+        )
+    except requests.exceptions.RequestException as e:
+        return f"Error: {str(e)}"
+
+    if res.status_code != 200:
+        return f"Error HTTP {res.status_code}: {res.text[:200]}"
+
+    try:
+        return card_result_to_objects(res.json())
+    except ValueError:
+        return f"Error: Response wasn't valid JSON: {res.text[:200]}"
 
 
-def fetch_order_data(order_id: int) -> dict:
+def fetch_order_data(order_id: int, session_token: str) -> dict:
     """جلب بيانات الطلب الكاملة من المصادر الأربعة في Metabase"""
     payload = {}
-    for key, url in METABASE_ENDPOINTS.items():
-        try:
-            full_url = build_metabase_url(url, order_id)
-            res = requests.get(full_url, timeout=15)
-            if res.status_code == 200:
-                try:
-                    payload[key] = res.json()
-                except ValueError:
-                    payload[key] = f"Error: Response wasn't valid JSON: {res.text[:200]}"
-            else:
-                payload[key] = f"Error HTTP {res.status_code}"
-        except requests.exceptions.RequestException as e:
-            payload[key] = f"Error: {str(e)}"
+    for key, card_id in METABASE_CARD_IDS.items():
+        payload[key] = fetch_card_data(card_id, order_id, session_token)
     return payload
 
 
@@ -335,9 +373,10 @@ def compute_last_diagnosis_duration(status_history):
     return matches[-1]
 
 
-def analyze_diagnosis_delay(api_key: str, order_id: int):
+def analyze_diagnosis_delay(api_key: str, metabase_username: str, metabase_password: str, order_id: int):
     """يرجع tuple: (نص رد الموديل, الحقائق الزمنية المحسوبة للتحقق منها في الواجهة)"""
-    order_data = fetch_order_data(order_id)
+    session_token = get_metabase_session_token(metabase_username, metabase_password)
+    order_data = fetch_order_data(order_id, session_token)
     timeline_facts = compute_timeline_facts(order_data.get('status_history'))
     last_diagnosis = compute_last_diagnosis_duration(order_data.get('status_history'))
 
@@ -518,6 +557,23 @@ with st.sidebar:
         + " ← ".join(MODEL_FALLBACK_LIST)
     )
 
+    st.markdown("---")
+    st.markdown("**بيانات دخول Metabase**")
+    st.caption("الروابط العامة اتلغت، فالكود بيسجّل دخول ببيانات حسابك الحقيقية في كل مرة.")
+
+    metabase_username_input = st.text_input(
+        "Metabase Username/Email",
+        value="",
+        help="يوزر نيم أو إيميل حساب Metabase بتاعك"
+    )
+
+    metabase_password_input = st.text_input(
+        "Metabase Password",
+        value="",
+        type="password",
+        help="باسورد حساب Metabase بتاعك"
+    )
+
 st.markdown("""
 <div class="mismar-header">
     <h1>🔧 نظام تدقيق تعطل الفحص والتشخيص (MisMar Diagnosis Delay Audit)</h1>
@@ -539,11 +595,13 @@ with col2:
     if analyze_btn:
         if not api_key_input:
             st.error("⚠️ يرجى إدخال Gemini API Key أولاً من القائمة الجانبية.")
+        elif not metabase_username_input or not metabase_password_input:
+            st.error("⚠️ يرجى إدخال بيانات دخول Metabase (يوزر نيم وباسورد) أولاً من القائمة الجانبية.")
         else:
             with st.spinner("⏳ جاري فحص أسباب تعطل مرحلة الفحص والتشخيص..."):
                 try:
                     full_response, timeline_debug = analyze_diagnosis_delay(
-                        api_key_input, order_id
+                        api_key_input, metabase_username_input, metabase_password_input, order_id
                     )
 
                     if "===CLASSIFICATION===" in full_response:
