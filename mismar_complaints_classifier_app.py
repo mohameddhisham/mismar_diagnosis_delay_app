@@ -281,6 +281,16 @@ DELAY_REASONS = [
     "المتابعه حتى تم وصول القطع",
 ]
 
+# ====== قاعدة الإلغاء ======
+# لو الشكوى عن إلغاء طلب:
+#   - الإلغاء من العميل  ← أساسي "ملاحظات او استفسارات" + فرعي خيار الإلغاء الوحيد في القايمة الفرعية
+#   - الإلغاء من جهتنا   ← أساسي "الغاء الطلب"
+# الموديل بيحدد مين صاحب الإلغاء في حقل cancellation، وبايثون هو اللي بيطبق القاعدة (مش الموديل).
+CANCELLATION_OPTIONS = ["لا ينطبق", "من العميل", "من مسمار"]
+CANCEL_BY_CUSTOMER_MAIN = "ملاحظات او استفسارات"
+CANCEL_BY_CUSTOMER_SUB = SUB_CATEGORIES["حالات أخرى"][0]  # "الغاء الطلب / اعتراض على الغاء الطلب / ..."
+CANCEL_BY_US_MAIN = "الغاء الطلب"
+
 
 # ====== الاتصال بـ Metabase (تسجيل دخول برمجي + استعلام الأسئلة الداخلية) ======
 def get_metabase_session_token(username: str, password: str) -> str:
@@ -496,6 +506,7 @@ def format_sub_categories() -> str:
 OUTPUT_EXAMPLE = """[
   {
     "ticket_id": "رقم التذكرة كما ورد في البيانات",
+    "cancellation": "لا ينطبق | من العميل | من مسمار",
     "main_category": "قيمة واحدة من قائمة التصنيف الأساسي",
     "sub_category": "قيمة واحدة من قائمة التصنيف الفرعي",
     "resolved": "نعم | لا | غير واضح",
@@ -546,6 +557,7 @@ def build_prompt(order_id: int, order_data: dict, tickets: list, ticket_facts: s
 6. لو الأدلة غير كافية لأي حقل فيه خيار "غير واضح" فاختره، ولا تخترع معلومات.
 7. اكتب القيم حرفيًا كما هي في القوائم، بدون أي تغيير في الكتابة أو المسافات.
 8. حقل reasoning: جملة أو جملتان بالعربية توضحان أهم دليل اعتمدت عليه، بدون ذكر أرقام التذاكر الداخلية.
+9. قاعدة الإلغاء: حدد في حقل cancellation هل الشكوى عن إلغاء طلب. "لا ينطبق" لو الشكوى ليست عن إلغاء، و"من العميل" لو العميل هو من طلب الإلغاء أو قرره، و"من مسمار" لو الإلغاء جاء من جهتنا (مسمار أو التشغيل أو المركز أو النظام). سيتم ضبط التصنيف الأساسي والفرعي تلقائيًا بناءً على هذا الحقل، فاختر قيمته بعناية وبناءً على الأدلة فقط.
 
 === 📋 قائمة التصنيف الأساسي ===
 {chr(10).join('- ' + option for option in MAIN_CATEGORIES)}
@@ -695,8 +707,28 @@ def normalize_item(raw) -> dict:
         responsible.pop(idx)
         responsible_flags.pop(idx)
 
+    # قاعدة الإلغاء (بتتطبق برمجيًا بعد رد الموديل)
+    cancellation, cancellation_flag = normalize_choice(raw.get("cancellation", "لا ينطبق"), CANCELLATION_OPTIONS)
+    if cancellation_flag == "invalid":
+        cancellation = "لا ينطبق"
+
+    rule_note = ""
+    if cancellation == "من العميل":
+        main, sub = CANCEL_BY_CUSTOMER_MAIN, CANCEL_BY_CUSTOMER_SUB
+        main_flag = sub_flag = "exact"
+        rule_note = (
+            f"قاعدة الإلغاء: الإلغاء من العميل ← التصنيف الأساسي «{main}» "
+            f"والتصنيف الفرعي «{sub}»."
+        )
+    elif cancellation == "من مسمار":
+        main = CANCEL_BY_US_MAIN
+        main_flag = "exact"
+        rule_note = f"قاعدة الإلغاء: الإلغاء من جهتنا ← التصنيف الأساسي «{main}»."
+
     return {
         "ticket_id": raw.get("ticket_id", ""),
+        "cancellation": cancellation,
+        "rule_note": rule_note,
         "main_category": main,
         "sub_category": sub,
         "resolved": resolved,
@@ -797,6 +829,11 @@ def render_ticket_result(item: dict):
             f'</div>'
         )
 
+    note_html = (
+        f'<div class="reasoning-box">⚖️ {html.escape(item["rule_note"])}</div>'
+        if item.get("rule_note") else ""
+    )
+
     reasoning_html = (
         f'<div class="reasoning-box"><b>سبب التصنيف:</b>\n{html.escape(item["reasoning"])}</div>'
         if item["reasoning"] else ""
@@ -804,7 +841,7 @@ def render_ticket_result(item: dict):
 
     st.markdown(
         f'<div class="ticket-card"><h4>🎫 تذكرة {html.escape(str(item["ticket_id"]))}</h4>'
-        f'{rows_html}{reasoning_html}</div>',
+        f'{rows_html}{note_html}{reasoning_html}</div>',
         unsafe_allow_html=True
     )
 
