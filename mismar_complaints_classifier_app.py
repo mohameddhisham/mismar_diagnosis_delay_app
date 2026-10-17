@@ -3,7 +3,7 @@ import html
 import json
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import requests
 import streamlit as st
 
@@ -76,10 +76,6 @@ st.markdown("""
         line-height: 1.8;
     }
 
-    .field-row:last-of-type {
-        border-bottom: none;
-    }
-
     .field-label {
         color: #9CA3AF;
         font-size: 0.92rem;
@@ -106,6 +102,23 @@ st.markdown("""
         line-height: 1.85;
         white-space: pre-wrap;
     }
+
+    .evidence-list {
+        margin: 8px 0 0 0;
+        padding-right: 18px;
+        list-style: none;
+    }
+
+    .evidence-list li {
+        padding: 4px 0;
+        line-height: 1.7;
+        font-size: 0.97rem;
+    }
+
+    .ev-ok   { color: #A7F3D0; }
+    .ev-warn { color: #FDE68A; }
+    .ev-src  { color: #9CA3AF; font-size: 0.85rem; }
+    .ev-none { color: #9CA3AF; margin-top: 6px; }
 
     .stButton>button {
         width: 100%;
@@ -138,15 +151,25 @@ METABASE_CARD_IDS = {
     "ticket_comments": 16191,  # ticket comments per order
 }
 
+# نوع باراميتر order_id مختلف من سؤال لسؤال: السؤالين الجداد (updates / ticket comments)
+# المتغير فيهم Text مش Number (Metabase رجّع خطأ 500: Parameter type must be one of :category, :text, :string/=)
+METABASE_PARAM_TYPES = {
+    "updates": "string/=",
+    "ticket_comments": "string/=",
+}
+DEFAULT_PARAM_TYPE = "number/="
+# لو Metabase رفض نوع الباراميتر، الكود بيجرب الأنواع دي بالترتيب تلقائيًا
+PARAM_TYPE_FALLBACKS = ["number/=", "string/=", "category"]
+
 # أقصى عدد حروف من كل مصدر بيتبعت للموديل (عشان منضربش حد التوكنز في الفري تير)
 MAX_SOURCE_CHARS = 30000
 
 # توقيتات جدول التذاكر بترجع من الـ SQL بتوقيت الرياض فعلاً (Asia/Riyadh)، عكس سجل الحالات
-# اللي بيرجع بتوقيت UTC. لو لقيت وقت فتح التذكرة المعروض في قسم التحقق متأخر 3 ساعات
-# عن الحقيقي في لوحة التحكم، غيّر القيمة دي لـ False.
+# اللي بيرجع بتوقيت UTC (فبنضيف له 3 ساعات). لو وقت فتح التذكرة المعروض في قسم التحقق
+# متأخر 3 ساعات عن الحقيقي في لوحة التحكم، غيّر القيمة دي لـ False.
 TICKET_TIMES_ALREADY_RIYADH = True
 
-# ساعات العمل المعتبرة لحساب مدة الإغلاق (لو وقت الإغلاق متاح في البيانات): 8ص-6م، والجمعة إجازة
+# ساعات العمل المعتبرة لحساب المدد: 8ص-6م، والجمعة إجازة
 WORK_START_HOUR = 8
 WORK_END_HOUR = 18
 FRIDAY_WEEKDAY = 4    # في بايثون: الإثنين=0 ... الخميس=3 ... الجمعة=4
@@ -156,6 +179,30 @@ ARABIC_WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "ا
 TICKET_ID_KEYS = ["Ticket_Id", "ticket_id", "TicketId", "id"]
 TICKET_CREATED_KEYS = ["Ticket_Created_At", "Created_At", "created_at", "createdAt"]
 TICKET_CLOSED_KEYS = ["Ticket_Closed_At", "Closed_At", "closed_at", "Resolved_At", "Ticket_Resolved_At"]
+
+# ====== مراحل طلب B2C (بتحدد فريق مسمار المسؤول عن المرحلة) ======
+# Confirmation: بداية الطلب، تأكيد الطلب، الاتفاق على الميعاد وعلى ميعاد سحب السيارة
+# Inspection: جاري الفحص والتشخيص / التسعير / بانتظار قطع الغيار
+# REPA: مراحل الإصلاح وتسليم السيارة وحتى نهاية الطلب
+# ⚠️ ده مؤشر مساعد للموديل مش حكم نهائي. الحالات اللي مش مذكورة هنا (معلق، تم الإلغاء، تم الرفض)
+# بتاخد مرحلة آخر حالة معروفة قبلها.
+PHASES = {
+    "CONF": ("Confirmation", "CONF B2C"),
+    "INSP": ("Inspection", "INSP B2C"),
+    "REPA": ("REPA", "REPA B2C"),
+}
+STATUS_TO_PHASE = {
+    "طلب جديد": "CONF", "طلب فوري": "CONF", "تم التأكيد": "CONF", "تم تأكيد موعدك": "CONF",
+    "بانتظار موعد أخذ السيارة": "CONF", "تم تنسيق السطحة": "CONF", "تغيير الموعد": "CONF",
+    "بانتظار الجدولة": "CONF", "مسمار في الطريق إليك": "CONF", "تم أخذ السيارة": "CONF",
+    "تم التسليم للمركز": "CONF",
+    "جاري الفحص والتشخيص": "INSP", "جاري التسعير": "INSP",
+    "بانتظار الموافقة على عرض السعر": "INSP", "عرض السعر قبل الاستلام": "INSP",
+    "بانتظار البدء بالإصلاحات": "REPA", "جاري العمل": "REPA", "اختبار جودة الإصلاحات": "REPA",
+    "جاهزة": "REPA", "بانتظار الدفع": "REPA", "بانتظار جدولة الاستلام": "REPA",
+    "بانتظار موعد الاستلام": "REPA", "سيارتك في الطريق إليك": "REPA",
+    "جاهزة للاستلام": "REPA", "تم التسليم": "REPA",
+}
 
 # ====== القوائم المعتمدة (القيم مكتوبة حرفيًا زي ما هي في الشيت) ======
 MAIN_CATEGORIES = [
@@ -252,8 +299,6 @@ SUB_CATEGORIES = {
 }
 ALL_SUB_CATEGORIES = [opt for group in SUB_CATEGORIES.values() for opt in group]
 
-RESOLVED_OPTIONS = ["نعم", "لا", "غير واضح"]
-
 RESPONSIBLE_OPTIONS = [
     "مركز", "قطع غيار", "مشرف BO", "عميل", "مزود الخدمة", "سبب خارجي- التأمين",
     "Customer Care", "لا يوجد", "سبب خارجي - السطحة", "غير واضح", "العامل",
@@ -291,6 +336,10 @@ CANCEL_BY_CUSTOMER_MAIN = "ملاحظات او استفسارات"
 CANCEL_BY_CUSTOMER_SUB = SUB_CATEGORIES["حالات أخرى"][0]  # "الغاء الطلب / اعتراض على الغاء الطلب / ..."
 CANCEL_BY_US_MAIN = "الغاء الطلب"
 
+# قيمة عمود الإجراء/الحالة لما الطلب رجيع (فقط "رجيع" لا غير)
+RETURN_ACTION_VALUE = "رجيع"
+RETURN_STATUS_NAME = "رجيع"  # اسم حالة الرجيع في سجل الحالات
+
 
 # ====== الاتصال بـ Metabase (تسجيل دخول برمجي + استعلام الأسئلة الداخلية) ======
 def get_metabase_session_token(username: str, password: str) -> str:
@@ -324,45 +373,60 @@ def card_result_to_objects(query_result: dict) -> list:
     return [dict(zip(col_names, row)) for row in rows]
 
 
-def fetch_card_data(card_id: int, order_id: int, session_token: str):
-    """يستعلم سؤال داخلي واحد في Metabase بالسيشن توكن ورقم الطلب كمتغير"""
-    parameters = [
-        {
-            "type": "number/=",
-            "target": ["variable", ["template-tag", "order_id"]],
-            "value": str(order_id)
-        }
-    ]
-    try:
-        res = requests.post(
-            f"{METABASE_BASE_URL}/api/card/{card_id}/query",
-            headers={"X-Metabase-Session": session_token},
-            json={"parameters": parameters},
-            timeout=60
-        )
-    except requests.exceptions.RequestException as e:
-        return f"Error: {str(e)}"
+def fetch_card_data(card_id: int, order_id: int, session_token: str, preferred_type: str = DEFAULT_PARAM_TYPE):
+    """
+    يستعلم سؤال داخلي واحد في Metabase بالسيشن توكن ورقم الطلب كمتغير.
+    لو Metabase رفض نوع الباراميتر (Invalid parameter type) بيجرب الأنواع التانية تلقائيًا.
+    """
+    types_to_try = [preferred_type] + [t for t in PARAM_TYPE_FALLBACKS if t != preferred_type]
+    last_error = "Error: لم تتم أي محاولة"
 
-    # Metabase بيرجّع 202 (Accepted) كرد ناجح لاستعلامات الأسئلة، فنقبل أي كود 2xx
-    if not (200 <= res.status_code < 300):
-        return f"Error HTTP {res.status_code}: {res.text[:200]}"
+    for param_type in types_to_try:
+        parameters = [
+            {
+                "type": param_type,
+                "target": ["variable", ["template-tag", "order_id"]],
+                "value": str(order_id)
+            }
+        ]
+        try:
+            res = requests.post(
+                f"{METABASE_BASE_URL}/api/card/{card_id}/query",
+                headers={"X-Metabase-Session": session_token},
+                json={"parameters": parameters},
+                timeout=60
+            )
+        except requests.exceptions.RequestException as e:
+            return f"Error: {str(e)}"
 
-    try:
-        body = res.json()
-    except ValueError:
-        return f"Error: Response wasn't valid JSON: {res.text[:200]}"
+        # Metabase بيرجّع 202 (Accepted) كرد ناجح لاستعلامات الأسئلة، فنقبل أي كود 2xx
+        if not (200 <= res.status_code < 300):
+            last_error = f"Error HTTP {res.status_code}: {res.text[:300]}"
+            if "Invalid parameter type" in res.text:
+                continue  # نوع الباراميتر مرفوض، نجرب اللي بعده
+            return last_error
 
-    # لو الاستعلام نفسه فشل، Metabase بيرجّع برضو 202 لكن جواه status=failed ورسالة الخطأ الحقيقية
-    if isinstance(body, dict) and (body.get("status") == "failed" or body.get("error")):
-        return f"Error (Metabase query failed): {str(body.get('error'))[:300]}"
+        try:
+            body = res.json()
+        except ValueError:
+            return f"Error: Response wasn't valid JSON: {res.text[:200]}"
 
-    return card_result_to_objects(body)
+        # لو الاستعلام نفسه فشل، Metabase بيرجّع برضو 202 لكن جواه status=failed ورسالة الخطأ الحقيقية
+        if isinstance(body, dict) and (body.get("status") == "failed" or body.get("error")):
+            last_error = f"Error (Metabase query failed): {str(body.get('error'))[:300]}"
+            if "Invalid parameter type" in str(body.get("error")):
+                continue
+            return last_error
+
+        return card_result_to_objects(body)
+
+    return last_error
 
 
 def fetch_order_data(order_id: int, session_token: str) -> dict:
     """جلب بيانات الطلب من كل المصادر الستة في Metabase"""
     return {
-        key: fetch_card_data(card_id, order_id, session_token)
+        key: fetch_card_data(card_id, order_id, session_token, METABASE_PARAM_TYPES.get(key, DEFAULT_PARAM_TYPE))
         for key, card_id in METABASE_CARD_IDS.items()
     }
 
@@ -382,7 +446,7 @@ def summarize_sources(order_data: dict) -> str:
     return "\n".join(lines)
 
 
-# ====== أدوات الوقت وحقائق التذاكر المحسوبة برمجيًا ======
+# ====== أدوات الوقت وسجل الحالات والحقائق المحسوبة برمجيًا ======
 def _parse_naive_dt(value):
     """يحاول يفهم صيغة التاريخ القادمة من Metabase (مثال: 2026-08-10 04:04 PM)"""
     if not value:
@@ -400,6 +464,10 @@ def _parse_ticket_dt(value):
     if dt and not TICKET_TIMES_ALREADY_RIYADH:
         dt += timedelta(hours=3)
     return dt
+
+
+def _now_riyadh() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
 
 
 def _format_timedelta(td) -> str:
@@ -442,10 +510,103 @@ def _first_value(row: dict, keys: list):
     return None
 
 
-def build_ticket_facts(tickets: list) -> str:
+def parse_status_rows(status_history) -> list:
+    """
+    يحوّل سجل الحالات لقائمة مرتبة بتوقيت الرياض. سجل الحالات بيرجع بتوقيت UTC
+    (متأخر 3 ساعات) فبنضيف 3 ساعات هنا عشان يتقارن صح مع توقيتات التذاكر.
+    """
+    if not isinstance(status_history, list):
+        return []
+    rows = []
+    for row in status_history:
+        if not isinstance(row, dict):
+            continue
+        name = _first_value(row, ["Status_Name", "status_name", "status"])
+        opened = _parse_naive_dt(_first_value(row, ["Opened_At", "opened_at", "created_at"]))
+        closed_raw = _first_value(row, ["Closed_At", "closed_at", "ended_at"])
+        if not name or not opened:
+            continue
+        opened += timedelta(hours=3)
+
+        if closed_raw and str(closed_raw).strip().lower() == "currently active":
+            closed, active = _now_riyadh(), True
+        else:
+            closed, active = _parse_naive_dt(closed_raw), False
+            if closed:
+                closed += timedelta(hours=3)
+        if closed is None:
+            continue
+        rows.append({"status": str(name).strip(), "opened": opened, "closed": closed, "active": active})
+    rows.sort(key=lambda r: r["opened"])
+    return rows
+
+
+def status_to_phase(status_name: str):
+    name = re.sub(r"\s+", " ", str(status_name)).strip()
+    if name in STATUS_TO_PHASE:
+        return STATUS_TO_PHASE[name]
+    if "قطع" in name:  # مثلاً: بانتظار قطع الغيار
+        return "INSP"
+    return None
+
+
+def phase_at_time(rows: list, when):
+    """حالة الطلب ومرحلته (CONF/INSP/REPA) وقت لحظة معينة (وقت فتح الشكوى)"""
+    if not rows or when is None:
+        return None, None
+    current = rows[0]
+    for r in rows:
+        if r["opened"] <= when:
+            current = r
+        else:
+            break
+    phase = status_to_phase(current["status"])
+    if phase is None:
+        # حالة مش مصنفة (معلق/إلغاء/رفض): ناخد مرحلة آخر حالة معروفة قبلها
+        idx = rows.index(current)
+        for earlier in reversed(rows[:idx]):
+            phase = status_to_phase(earlier["status"])
+            if phase:
+                break
+    return current["status"], phase
+
+
+def find_return_rows(rows: list) -> list:
+    """صفوف سجل الحالات اللي حالتها «رجيع»"""
+    return [r for r in rows if re.sub(r"\s+", " ", r["status"]).strip() == RETURN_STATUS_NAME]
+
+
+def build_status_timeline_facts(rows: list) -> str:
+    """الجدول الزمني للحالات بتوقيت الرياض، مع المدة الخام وبساعات العمل الفعلية لكل حالة"""
+    if not rows:
+        return "⚠️ لا توجد بيانات سجل حالات صالحة للحساب."
+    lines = []
+    for r in rows:
+        raw_gap = r["closed"] - r["opened"]
+        work_gap = business_hours_duration(r["opened"], r["closed"])
+        end_text = "لسه شغالة حتى الآن" if r["active"] else r["closed"].strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"- {r['status']}: من {r['opened'].strftime('%Y-%m-%d %H:%M')} إلى {end_text} | "
+            f"المدة الخام {_format_timedelta(raw_gap)} | بساعات العمل الفعلية {_format_timedelta(work_gap)}"
+        )
+    total = rows[-1]["closed"] - rows[0]["opened"]
+    lines.append(
+        f"- إجمالي عمر الطلب من أول حالة لآخر حالة: {_format_timedelta(total)} "
+        f"(بساعات العمل الفعلية {_format_timedelta(business_hours_duration(rows[0]['opened'], rows[-1]['closed']))})"
+    )
+    returns = find_return_rows(rows)
+    if returns:
+        lines.append(
+            f"- ⚠️ الطلب مرّ بحالة «{RETURN_STATUS_NAME}» ({len(returns)} مرة)، "
+            f"أول مرة بتاريخ {returns[0]['opened'].strftime('%Y-%m-%d %H:%M')}."
+        )
+    return "\n".join(lines)
+
+
+def build_ticket_facts(tickets: list, status_rows: list, target_ids: set) -> str:
     """
     حقائق محسوبة بدقة ببايثون لكل تذكرة: وقت الفتح ويومه، وهل اتفتحت الخميس مساءً أو الجمعة،
-    ومدة الإغلاق (لو وقت الإغلاق متاح في بيانات التذكرة). الموديل مش بيحسب أي وقت بنفسه.
+    ومرحلة الطلب وقت فتح الشكوى (من سجل الحالات)، ومدة الإغلاق لو وقت الإغلاق متاح.
     """
     lines = []
     for ticket in tickets:
@@ -455,20 +616,29 @@ def build_ticket_facts(tickets: list) -> str:
         created = _parse_ticket_dt(_first_value(ticket, TICKET_CREATED_KEYS))
         closed = _parse_ticket_dt(_first_value(ticket, TICKET_CLOSED_KEYS))
         status = ticket.get("Ticket_Status")
+        is_target = str(ticket_id) in target_ids if target_ids else True
 
-        parts = [f"- تذكرة {ticket_id}"]
+        parts = [f"- تذكرة {ticket_id}" + (" (🎯 المطلوب تصنيفها)" if is_target else " (سياق فقط)")]
         if status:
             parts.append(f"(حالتها: {status})")
 
         if created:
             weekday = created.weekday()
-            day_name = ARABIC_WEEKDAYS[weekday]
-            parts.append(f": فُتحت {created.strftime('%Y-%m-%d %H:%M')} يوم {day_name}.")
+            parts.append(f": فُتحت {created.strftime('%Y-%m-%d %H:%M')} يوم {ARABIC_WEEKDAYS[weekday]}.")
             thursday_evening = weekday == THURSDAY_WEEKDAY and created.hour >= WORK_END_HOUR
             if weekday == FRIDAY_WEEKDAY or thursday_evening:
                 parts.append("⚠️ فُتحت الخميس مساءً أو يوم الجمعة (خارج أيام/ساعات العمل).")
             else:
                 parts.append("فُتحت داخل أيام العمل (ليست الخميس مساءً ولا الجمعة).")
+
+            status_name, phase = phase_at_time(status_rows, created)
+            if status_name and phase:
+                phase_label, team = PHASES[phase]
+                parts.append(
+                    f"حالة الطلب وقت فتح الشكوى: «{status_name}» ← مرحلة {phase_label} (فريق {team})."
+                )
+            elif status_name:
+                parts.append(f"حالة الطلب وقت فتح الشكوى: «{status_name}» (مرحلتها غير محددة، استنتجها من الأدلة).")
         else:
             parts.append(": وقت فتح التذكرة غير متوفر في البيانات.")
 
@@ -487,6 +657,59 @@ def build_ticket_facts(tickets: list) -> str:
     return "\n".join(lines) if lines else "لا توجد تذاكر."
 
 
+# ====== التحقق من الأدلة: هل الاقتباس موجود فعلاً في البيانات؟ ======
+_ARABIC_MARKS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]")
+
+
+def _loose(text) -> str:
+    """تطبيع متسامح للمقارنة: يشيل التشكيل والتطويل وعلامات الترقيم ويوحّد أشكال الألف والياء والتاء المربوطة"""
+    t = _ARABIC_MARKS.sub("", str(text))
+    t = re.sub("[أإآ]", "ا", t).replace("ى", "ي").replace("ة", "ه")
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+
+def _collect_strings(obj, out: list):
+    if isinstance(obj, dict):
+        for value in obj.values():
+            _collect_strings(value, out)
+    elif isinstance(obj, list):
+        for value in obj:
+            _collect_strings(value, out)
+    elif obj is not None:
+        out.append(str(obj))
+
+
+def build_haystack(order_data: dict, extra_texts: list) -> str:
+    """كل النصوص اللي الموديل شافها (البيانات الخام + الحقائق المحسوبة)، لاستخدامها في التحقق من الاقتباسات"""
+    strings = []
+    _collect_strings(order_data, strings)
+    strings.extend(extra_texts)
+    return _loose(" ".join(strings))
+
+
+def verify_evidence(evidence, haystack: str) -> list:
+    """يرجّع قائمة {source, quote, verified}. verified=True لو الاقتباس موجود فعلاً في البيانات"""
+    checked = []
+    if not isinstance(evidence, list):
+        return checked
+    for entry in evidence:
+        if isinstance(entry, dict):
+            source = str(entry.get("source", "")).strip()
+            quote = str(entry.get("quote", "")).strip()
+        else:
+            source, quote = "", str(entry).strip()
+        if not quote:
+            continue
+        loose_quote = _loose(quote)
+        checked.append({
+            "source": source,
+            "quote": quote,
+            "verified": len(loose_quote) >= 6 and loose_quote in haystack,
+        })
+    return checked
+
+
 # ====== تجهيز البيانات للبرومبت ======
 def compact_dump(data, max_chars: int = MAX_SOURCE_CHARS) -> str:
     text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
@@ -503,27 +726,58 @@ def format_sub_categories() -> str:
     return "\n".join(parts)
 
 
+# شرح منطق اختيار مسؤول الضرر (أمثلة توضّح طريقة التفكير، مش جدول ثابت)
+RESPONSIBLE_GUIDE = """الفكرة العامة: مسؤول الضرر يتكوّن من جزئين:
+ (أ) الجهة اللي نفّذت الشغل أو تسببت فعليًا في المشكلة (مركز، قطع غيار، سطحة، تأمين، عميل... إلخ).
+ (ب) فريق مسمار المسؤول عن المرحلة اللي حصلت فيها المشكلة، بيدخل كمسؤول لما يكون التقصير في المتابعة أو التحديث أو التنسيق أو التأكد من الجودة أو الالتزام بالمواعيد.
+
+مراحل طلب B2C وفريق كل مرحلة:
+ - Confirmation (فريق CONF B2C): بداية الطلب، تأكيد الطلب، الاتفاق على الميعاد، الاتفاق على ميعاد سحب السيارة، وهكذا.
+ - Inspection (فريق INSP B2C): لما يكون الطلب في جاري الفحص والتشخيص أو التسعير أو بانتظار قطع الغيار.
+ - REPA (فريق REPA B2C): مراحل الإصلاحات وتسليم السيارة وحتى نهاية الطلب.
+ المرحلة بتتحدد من حالة الطلب وقت فتح الشكوى (موضحة لكل تذكرة في الحقائق المحسوبة). اعتمد عليها، ولا تخالفها إلا لو الأدلة تثبت بوضوح إن الشكوى تخص مرحلة تانية.
+
+أمثلة توضح طريقة التفكير (طبّق نفس المنطق على أي شكوى، ولا تعتبرها حالات حصرية):
+ 1) العميل مش راضي عن جودة الإصلاح: المركز هو المسؤول عن تنفيذ الإصلاح، وREPA B2C هو المسؤول عن التأكد من جودة الإصلاحات ← "مركز" + "REPA B2C".
+ 2) تأخير في الإصلاح:
+    - لو قطع الغيار هي سبب التأخير ← "قطع غيار".
+    - لو مش قطع الغيار ← "مركز" هو المسؤول عن التأخير.
+    - ويدخل معاه "REPA B2C" لو كان للطلب موعد/مدة محددة للعميل وتخطاها الطلب (مثلًا اتحدد له 5 أيام عمل واستغرق 7) ولم يتم تحديث العميل بأيام العمل الزيادة.
+ القاعدة اللي بتتكرر: الجهة المنفّذة هي المسؤولة عن الشغل نفسه، وفريق المرحلة مسؤول عن الجودة والمتابعة وتحديث العميل في مرحلته. لو الدليل بيثبت إن فريق المرحلة تابع وحدّث العميل بشكل سليم، متدخلوش."""
+
+
 OUTPUT_EXAMPLE = """[
   {
     "ticket_id": "رقم التذكرة كما ورد في البيانات",
     "cancellation": "لا ينطبق | من العميل | من مسمار",
     "main_category": "قيمة واحدة من قائمة التصنيف الأساسي",
     "sub_category": "قيمة واحدة من قائمة التصنيف الفرعي",
-    "resolved": "نعم | لا | غير واضح",
     "responsible": ["قيمة أو أكثر من قائمة مسؤول الضرر"],
+    "responsible_reasoning": "من جملتين لثلاث: ليه اخترت الجهات دي، وإيه مرحلة الطلب وقت الشكوى",
+    "responsible_evidence": [{"source": "نوع المصدر + التاريخ لو موجود", "quote": "اقتباس حرفي من البيانات"}],
     "delay_reason": "قيمة واحدة من قائمة أسباب التأخير",
-    "reasoning": "جملة أو جملتان توضحان الدليل الذي بُني عليه التصنيف"
+    "reasoning": "جملة أو جملتان: سبب التصنيف الأساسي والفرعي وسبب التأخير",
+    "evidence": [{"source": "نوع المصدر + التاريخ لو موجود", "quote": "اقتباس حرفي من البيانات"}]
   }
 ]"""
 
 
-def build_prompt(order_id: int, order_data: dict, tickets: list, ticket_facts: str) -> str:
+def build_prompt(order_id: int, order_data: dict, all_tickets: list, target_ids: list,
+                 ticket_facts: str, status_timeline: str) -> str:
+    target_text = "، ".join(target_ids)
+    main_list = "\n".join("- " + option for option in MAIN_CATEGORIES)
+    delay_list = "\n".join("- " + option for option in DELAY_REASONS)
+    responsible_list = " | ".join(RESPONSIBLE_OPTIONS)
+
     return f"""
 أنت مدقق جودة وشكاوى في شركة صيانة السيارات (مسمار - MisMar).
-مهمتك تصنيف تذاكر الشكاوى الخاصة بالطلب رقم #{order_id} وفق القوائم المعتمدة أدناه، بالاعتماد فقط على البيانات الفعلية الموجودة، ودون أي تخمين.
+مهمتك تصنيف تذاكر الشكاوى المحددة أدناه للطلب رقم #{order_id} وفق القوائم المعتمدة، بالاعتماد فقط على البيانات الفعلية الموجودة، ودون أي تخمين.
 
-=== 🎫 التذاكر المطلوب تصنيفها (المصدر الأساسي: Description = وصف الشكوى، Result = نتيجة التذكرة) ===
-{compact_dump(tickets)}
+=== 🎯 التذاكر المطلوب تصنيفها (أرقامها): {target_text} ===
+باقي تذاكر الطلب المعروضة تحت هي للسياق فقط (قد تفسّر الشكوى وتحدد المسؤول)؛ استفد منها لكن لا تصنّفها، واكتب عنصرًا في الإخراج لكل تذكرة مطلوبة فقط.
+
+=== 🎫 كل تذاكر الطلب (Description = وصف الشكوى، Result = نتيجة التذكرة) ===
+{compact_dump(all_tickets)}
 
 === ⏱️ حقائق محسوبة برمجيًا لكل تذكرة (إلزامية الاستخدام، ولا تحسب أي وقت بنفسك) ===
 {ticket_facts}
@@ -537,45 +791,52 @@ def build_prompt(order_id: int, order_data: dict, tickets: list, ticket_facts: s
 === 💬 محادثات الطلب والتعليقات الداخلية (التشغيل / المركز / العميل) ===
 {compact_dump(order_data.get('comments'))}
 
-=== ⏳ سجل حالات الطلب (ملحوظة: توقيتاته بتوقيت UTC أي متأخرة 3 ساعات عن توقيت الرياض) ===
-{compact_dump(order_data.get('status_history'))}
+=== ⏳ الجدول الزمني لحالات الطلب (محسوب برمجيًا، وكل التوقيتات بتوقيت الرياض) ===
+{status_timeline}
 
 === 💰 طلبات التسعير وعروض الأسعار ===
 {compact_dump(order_data.get('pricing'))}
 
+=== 🧭 كيف نختار مسؤول الضرر ===
+{RESPONSIBLE_GUIDE}
+
 === 🎯 قواعد التصنيف (إلزامية) ===
 1. التصنيف الأساسي: قيمة واحدة بالضبط من القائمة، حسب جوهر الشكوى كما في وصف التذكرة ونتيجتها وتعليقاتها.
 2. التصنيف الفرعي: قيمة واحدة بالضبط من القائمة الفرعية، الأقرب لتفاصيل الشكوى، ويفضل أن تكون متسقة مع التصنيف الأساسي.
-3. هل تم حل المشكلة: "نعم" فقط لو وُجد دليل صريح (نتيجة التذكرة أو تعليقاتها أو التحديثات) على حل المشكلة فعليًا أو رضا العميل؛ "لا" لو ثبت استمرارها أو رفض العميل للحل؛ وغير ذلك "غير واضح".
-4. مسؤول الضرر: اختيار متعدد. حدد الجهات التي تسببت فعليًا في المشكلة محل الشكوى (وليس في تأخر إغلاقها).
+3. مسؤول الضرر: اختيار متعدد، بحسب منطق الشرح أعلاه (الجهة المنفذة/المتسببة + فريق المرحلة عند التقصير في المتابعة أو الجودة أو التحديث).
+   - المقصود المسؤول عن المشكلة محل الشكوى نفسها، وليس عن التأخر في إغلاق الشكوى.
    - "لا يوجد" تُستخدم وحدها فقط (لو الشكوى غير صحيحة أو لا طرف مسؤول)، ولا تُدمج مع جهات أخرى.
    - "غير واضح" لو لا يمكن تحديد المسؤول من البيانات.
    - لا تخترع جهات من خارج القائمة.
-5. سبب التأخير في غلق الشكوى: قيمة واحدة. استخدم وقت فتح التذكرة (والإغلاق إن وُجد) وتسلسل تعليقاتها والتحديثات لتحديد سبب الفجوة بين الفتح والإغلاق.
+4. سبب التأخير في غلق الشكوى: قيمة واحدة. استخدم وقت فتح التذكرة (والإغلاق إن وُجد) وتسلسل تعليقاتها والتحديثات لتحديد سبب الفجوة بين الفتح والإغلاق.
    - لا يوجد حد زمني رسمي للتأخير؛ احكم من الأدلة وليس من الرقم وحده، و"لا يوجد تأخير" لو أُغلقت الشكوى بمعالجة معقولة ومتتابعة.
    - لو الحقائق المحسوبة تقول إن التذكرة فُتحت الخميس مساءً أو الجمعة وكانت العطلة هي سبب الفجوة، اختر "تم فتح الشكوى يوم الخميس مساءا او الجمعة"، إلا لو في التعليقات سبب أوضح وأقوى (مثل تأخر رد المركز) فاختره بدلًا منها.
-6. لو الأدلة غير كافية لأي حقل فيه خيار "غير واضح" فاختره، ولا تخترع معلومات.
-7. اكتب القيم حرفيًا كما هي في القوائم، بدون أي تغيير في الكتابة أو المسافات.
-8. حقل reasoning: جملة أو جملتان بالعربية توضحان أهم دليل اعتمدت عليه، بدون ذكر أرقام التذاكر الداخلية.
-9. قاعدة الإلغاء: حدد في حقل cancellation هل الشكوى عن إلغاء طلب. "لا ينطبق" لو الشكوى ليست عن إلغاء، و"من العميل" لو العميل هو من طلب الإلغاء أو قرره، و"من مسمار" لو الإلغاء جاء من جهتنا (مسمار أو التشغيل أو المركز أو النظام). سيتم ضبط التصنيف الأساسي والفرعي تلقائيًا بناءً على هذا الحقل، فاختر قيمته بعناية وبناءً على الأدلة فقط.
+5. الإجراء: بيتحدد برمجيًا من حالة «رجيع» في سجل الحالات، فمتكتبش عنه أي حاجة في الإخراج.
+6. الأدلة (إلزامية): كل تصنيف لازم يكون معاه دليل.
+   - evidence: من 1 إلى 3 أدلة لسبب التصنيف الأساسي والفرعي وسبب التأخير.
+   - responsible_evidence: من 1 إلى 3 أدلة لسبب اختيار مسؤول الضرر.
+   - كل دليل = source (نوع المصدر مع التاريخ/الوقت لو موجود، مثل: «وصف التذكرة»، «نتيجة التذكرة»، «تعليق تذكرة 2026-10-05 10:30»، «تحديث الطلب»، «محادثة الطلب»، «التسعير»، «الجدول الزمني للحالات») + quote (اقتباس حرفي متصل منسوخ كما هو من البيانات أعلاه بما فيها الحقائق المحسوبة، لا يتجاوز 20 كلمة، بدون تعديل أو اختصار أو علامات "..." ).
+   - ممنوع تأليف اقتباسات. سيتم التحقق آليًا من وجود كل اقتباس في البيانات، وأي اقتباس غير موجود حرفيًا سيُعلَّم كغير موثوق.
+   - لو مفيش أي دليل مباشر، اترك القائمة فاضية، واختر "غير واضح" في الحقول اللي فيها الخيار ده.
+7. لو الأدلة غير كافية لأي حقل فيه خيار "غير واضح" فاختره، ولا تخترع معلومات.
+8. اكتب القيم حرفيًا كما هي في القوائم، بدون أي تغيير في الكتابة أو المسافات.
+9. حقلا responsible_reasoning وreasoning: جمل قصيرة بالعربية، بدون ذكر أرقام التذاكر الداخلية.
+10. قاعدة الإلغاء: حدد في حقل cancellation هل الشكوى عن إلغاء طلب. "لا ينطبق" لو الشكوى ليست عن إلغاء، و"من العميل" لو العميل هو من طلب الإلغاء أو قرره، و"من مسمار" لو الإلغاء جاء من جهتنا (مسمار أو التشغيل أو المركز أو النظام). سيتم ضبط التصنيف الأساسي والفرعي تلقائيًا بناءً على هذا الحقل، فاختر قيمته بعناية وبناءً على الأدلة فقط.
 
 === 📋 قائمة التصنيف الأساسي ===
-{chr(10).join('- ' + option for option in MAIN_CATEGORIES)}
+{main_list}
 
 === 📋 قائمة التصنيف الفرعي (مقسمة لمجموعات للتسهيل فقط؛ القيمة المختارة تُكتب بدون اسم المجموعة) ===
 {format_sub_categories()}
 
-=== 📋 قائمة هل تم حل المشكلة ===
-{' | '.join(RESOLVED_OPTIONS)}
-
 === 📋 قائمة مسؤول الضرر (اختيار متعدد) ===
-{' | '.join(RESPONSIBLE_OPTIONS)}
+{responsible_list}
 
 === 📋 قائمة سبب التأخير في غلق الشكوى ===
-{chr(10).join('- ' + option for option in DELAY_REASONS)}
+{delay_list}
 
 === 📤 شكل الإخراج ===
-أخرج JSON فقط (بدون أي نص خارجه)، عبارة عن مصفوفة فيها عنصر واحد لكل تذكرة من التذاكر أعلاه وبنفس الترتيب:
+أخرج JSON فقط (بدون أي نص خارجه)، عبارة عن مصفوفة فيها عنصر واحد لكل تذكرة من التذاكر المطلوب تصنيفها ({target_text}) وبنفس ترتيبها:
 {OUTPUT_EXAMPLE}
 """
 
@@ -685,7 +946,6 @@ def normalize_item(raw) -> dict:
 
     main, main_flag = normalize_choice(raw.get("main_category", ""), MAIN_CATEGORIES)
     sub, sub_flag = normalize_choice(raw.get("sub_category", ""), ALL_SUB_CATEGORIES)
-    resolved, resolved_flag = normalize_choice(raw.get("resolved", ""), RESOLVED_OPTIONS)
     delay, delay_flag = normalize_choice(raw.get("delay_reason", ""), DELAY_REASONS)
 
     responsible_raw = raw.get("responsible", [])
@@ -731,14 +991,16 @@ def normalize_item(raw) -> dict:
         "rule_note": rule_note,
         "main_category": main,
         "sub_category": sub,
-        "resolved": resolved,
+        "action": "",  # بيتحدد برمجيًا من حالة «رجيع» في analyze_complaints
         "responsible": responsible,
+        "responsible_reasoning": str(raw.get("responsible_reasoning", "")).strip(),
+        "responsible_evidence_raw": raw.get("responsible_evidence", []),
         "delay_reason": delay,
         "reasoning": str(raw.get("reasoning", "")).strip(),
+        "evidence_raw": raw.get("evidence", []),
         "flags": {
             "main_category": main_flag,
             "sub_category": sub_flag,
-            "resolved": resolved_flag,
             "responsible": _worst_flag(responsible_flags),
             "delay_reason": delay_flag,
         },
@@ -752,32 +1014,51 @@ def analyze_complaints(api_key: str, metabase_username: str, metabase_password: 
     order_data = fetch_order_data(order_id, session_token)
     sources_summary = summarize_sources(order_data)
 
-    tickets = order_data.get("tickets")
-    if not isinstance(tickets, list):
+    all_tickets = order_data.get("tickets")
+    if not isinstance(all_tickets, list):
         raise Exception(f"تعذر جلب تذاكر هذا الطلب من Metabase:\n{sources_summary}")
-    if not tickets:
+    if not all_tickets:
         raise Exception(f"لا توجد أي تذاكر لهذا الطلب.\n{sources_summary}")
 
+    all_ids = [str(_first_value(t, TICKET_ID_KEYS)) for t in all_tickets if isinstance(t, dict)]
+
+    # رقم التذكرة بيحدد التذكرة (التذاكر) المطلوب تصنيفها فقط؛ باقي التذاكر بتفضل في سياق الموديل
     if ticket_id_filter:
-        selected = [
-            t for t in tickets
-            if isinstance(t, dict) and str(_first_value(t, TICKET_ID_KEYS)) == str(ticket_id_filter)
-        ]
-        if not selected:
-            available = ", ".join(
-                str(_first_value(t, TICKET_ID_KEYS)) for t in tickets if isinstance(t, dict)
-            )
+        if str(ticket_id_filter) not in all_ids:
             raise Exception(
                 f"لا توجد تذكرة برقم {ticket_id_filter} ضمن تذاكر هذا الطلب. "
-                f"التذاكر الموجودة: {available}"
+                f"التذاكر الموجودة: {', '.join(all_ids)}"
             )
-        tickets = selected
+        target_ids = [str(ticket_id_filter)]
+    else:
+        target_ids = all_ids
 
-    ticket_facts = build_ticket_facts(tickets)
-    prompt_text = build_prompt(order_id, order_data, tickets, ticket_facts)
+    status_rows = parse_status_rows(order_data.get("status_history"))
+    status_timeline = build_status_timeline_facts(status_rows)
+    if not status_rows:
+        # لو سجل الحالات مش متاح، بنبعت الخام عشان الموديل يشوف الخطأ/البيانات
+        status_timeline += "\n(البيانات الخام): " + compact_dump(order_data.get("status_history"), 2000)
+
+    ticket_facts = build_ticket_facts(all_tickets, status_rows, set(target_ids))
+    prompt_text = build_prompt(order_id, order_data, all_tickets, target_ids, ticket_facts, status_timeline)
 
     raw_text = call_gemini_with_fallback(api_key, prompt_text)
     items = [normalize_item(raw) for raw in parse_model_json(raw_text)]
+
+    # نحتفظ فقط بالتذاكر المطلوبة (لو الموديل رجّع تذاكر زيادة)، ولو الأرقام مش متطابقة نسيب كل النتائج
+    filtered = [item for item in items if str(item["ticket_id"]) in target_ids]
+    if filtered:
+        items = filtered
+
+    # الإجراء: «رجيع» لو الطلب مرّ بحالة رجيع في سجل الحالات، وغير كده فاضي
+    return_rows = find_return_rows(status_rows)
+    for item in items:
+        item["action"] = RETURN_ACTION_VALUE if return_rows else ""
+
+    haystack = build_haystack(order_data, [ticket_facts, status_timeline])
+    for item in items:
+        item["evidence"] = verify_evidence(item.pop("evidence_raw"), haystack)
+        item["responsible_evidence"] = verify_evidence(item.pop("responsible_evidence_raw"), haystack)
 
     truncated = [
         key for key, value in order_data.items()
@@ -788,21 +1069,15 @@ def analyze_complaints(api_key: str, metabase_username: str, metabase_password: 
         "items": items,
         "raw_model_text": raw_text,
         "ticket_facts": ticket_facts,
+        "status_timeline": status_timeline,
         "sources_summary": sources_summary,
         "truncated_sources": truncated,
+        "target_ids": target_ids,
         "order_id": order_id,
     }
 
 
 # ====== عرض النتائج ======
-FIELD_LABELS = [
-    ("main_category", "التصنيف الأساسي"),
-    ("sub_category", "تصنيف فرعي"),
-    ("resolved", "هل تم حل المشكلة"),
-    ("responsible", "مسؤول الضرر"),
-    ("delay_reason", "سبب التأخير في غلق الشكوى"),
-]
-
 FLAG_BADGES = {
     "exact": ('badge-ok', "✅"),
     "corrected": ('badge-warn', "⚠️ صُحّح تلقائيًا لأقرب قيمة في القائمة"),
@@ -810,46 +1085,93 @@ FLAG_BADGES = {
 }
 
 
-def display_value(item: dict, field: str) -> str:
-    value = item[field]
-    if field == "responsible":
-        return ", ".join(value) if value else "—"
-    return value or "—"
+def display_responsible(item: dict) -> str:
+    return ", ".join(item["responsible"]) if item["responsible"] else "—"
+
+
+def evidence_html(entries: list) -> str:
+    if not entries:
+        return '<div class="ev-none">لا توجد أدلة مباشرة مذكورة.</div>'
+    items_html = ""
+    for entry in entries:
+        icon, css = ("✅", "ev-ok") if entry["verified"] else ("⚠️", "ev-warn")
+        source = f' <span class="ev-src">({html.escape(entry["source"])})</span>' if entry["source"] else ""
+        warning = "" if entry["verified"] else ' <span class="ev-src">— الاقتباس غير موجود حرفيًا في البيانات، راجعه</span>'
+        items_html += f'<li class="{css}">{icon} «{html.escape(entry["quote"])}»{source}{warning}</li>'
+    return f'<ul class="evidence-list">{items_html}</ul>'
+
+
+def reason_box(title: str, text: str, entries: list) -> str:
+    body = html.escape(text) if text else "—"
+    return f'<div class="reasoning-box"><b>{html.escape(title)}</b>\n{body}{evidence_html(entries)}</div>'
+
+
+def sheet_reason_text(text: str, entries: list) -> str:
+    """سبب + أدلة في سطر واحد جاهز للصق في خلية واحدة في الشيت"""
+    parts = [text.strip()] if text.strip() else []
+    quotes = []
+    for entry in entries:
+        quote = f"«{entry['quote']}»"
+        if entry["source"]:
+            quote += f" ({entry['source']})"
+        if not entry["verified"]:
+            quote += " [غير موثّق]"
+        quotes.append(quote)
+    if quotes:
+        parts.append("الأدلة: " + " ، ".join(quotes))
+    return re.sub(r"\s*\n\s*", " | ", " — ".join(parts))
 
 
 def render_ticket_result(item: dict):
-    rows_html = ""
-    for field, label in FIELD_LABELS:
-        css_class, badge_text = FLAG_BADGES[item["flags"][field]]
-        rows_html += (
-            f'<div class="field-row">'
-            f'<span class="field-label">{html.escape(label)}</span>'
-            f'<span class="field-value">{html.escape(display_value(item, field))}</span>'
-            f'<span class="{css_class}">{html.escape(badge_text)}</span>'
-            f'</div>'
+    def row(label, value, flag=None):
+        badge = ""
+        if flag:
+            css_class, badge_text = FLAG_BADGES[flag]
+            badge = f'<span class="{css_class}">{html.escape(badge_text)}</span>'
+        return (
+            f'<div class="field-row"><span class="field-label">{html.escape(label)}</span>'
+            f'<span class="field-value">{html.escape(value)}</span>{badge}</div>'
         )
+
+    rows_html = (
+        row("التصنيف الأساسي", item["main_category"], item["flags"]["main_category"])
+        + row("تصنيف فرعي", item["sub_category"], item["flags"]["sub_category"])
+        + row("الإجراء / الحالة", item["action"] or "— (يُترك فارغًا)")
+        + row("مسؤول الضرر", display_responsible(item), item["flags"]["responsible"])
+        + row("سبب التأخير في غلق الشكوى", item["delay_reason"], item["flags"]["delay_reason"])
+    )
 
     note_html = (
         f'<div class="reasoning-box">⚖️ {html.escape(item["rule_note"])}</div>'
         if item.get("rule_note") else ""
     )
 
-    reasoning_html = (
-        f'<div class="reasoning-box"><b>سبب التصنيف:</b>\n{html.escape(item["reasoning"])}</div>'
-        if item["reasoning"] else ""
-    )
-
     st.markdown(
         f'<div class="ticket-card"><h4>🎫 تذكرة {html.escape(str(item["ticket_id"]))}</h4>'
-        f'{rows_html}{note_html}{reasoning_html}</div>',
+        f'{rows_html}{note_html}'
+        f'{reason_box("سبب اختيار مسؤول الضرر", item["responsible_reasoning"], item["responsible_evidence"])}'
+        f'{reason_box("سبب التصنيف", item["reasoning"], item["evidence"])}'
+        f'</div>',
         unsafe_allow_html=True
     )
 
-    # نصوص جاهزة للنسخ في الشيت (عمود الإجراء/الحالة مش متضمن لأنه بيتكتب يدويًا)
+    # نصوص جاهزة للنسخ في الشيت
     st.caption("نسخ للشيت — التصنيف الأساسي + التصنيف الفرعي (خليتين متجاورتين):")
     st.code("\t".join([item["main_category"], item["sub_category"]]), language=None)
-    st.caption("نسخ للشيت — هل تم الحل + مسؤول الضرر + سبب التأخير (3 خلايا متجاورة):")
-    st.code("\t".join([item["resolved"], display_value(item, "responsible"), item["delay_reason"]]), language=None)
+    if item["action"]:
+        st.caption("نسخ للشيت — الإجراء/الحالة:")
+        st.code(item["action"], language=None)
+    else:
+        st.caption("الإجراء/الحالة: سيب الخلية فاضية (الطلب مش رجيع).")
+    st.caption("نسخ للشيت — مسؤول الضرر + سبب الاختيار + سبب التأخير (3 خلايا متجاورة):")
+    st.code(
+        "\t".join([
+            display_responsible(item),
+            sheet_reason_text(item["responsible_reasoning"], item["responsible_evidence"]),
+            item["delay_reason"],
+        ]),
+        language=None
+    )
 
 
 # ====== الواجهة ======
@@ -889,7 +1211,7 @@ with st.sidebar:
 st.markdown("""
 <div class="mismar-header">
     <h1>🗂️ نظام تصنيف الشكاوى (MisMar Complaints Classifier)</h1>
-    <p>قراءة تذكرة الشكوى ونتيجتها وتعليقاتها وربطها ببيانات الطلب، ثم تصنيفها وفق القوائم المعتمدة</p>
+    <p>قراءة تذكرة الشكوى ونتيجتها وتعليقاتها وربطها ببيانات الطلب، ثم تصنيفها وتحديد مسؤول الضرر بأدلة موثقة</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -899,11 +1221,12 @@ with col1:
     st.subheader("📋 بيانات الطلب")
     order_id = st.number_input("رقم الطلب (Order ID)", value=1037315, step=1)
     ticket_id_filter = st.number_input(
-        "رقم التذكرة (اختياري)",
+        "رقم تذكرة الشكوى (اختياري)",
         value=0,
         min_value=0,
         step=1,
-        help="سيبها 0 عشان يصنّف كل تذاكر الطلب، أو اكتب رقم تذكرة بعينها."
+        help="رقم تذكرة الشكوى المطلوب تصنيفها. باقي تذاكر الطلب بتفضل مقروءة كسياق للموديل. "
+             "سيبها 0 عشان يصنّف كل تذاكر الطلب."
     )
     st.markdown("<br>", unsafe_allow_html=True)
     analyze_btn = st.button("🚀 تصنيف الشكوى")
@@ -946,7 +1269,9 @@ with col2:
             st.text(result["sources_summary"])
             st.markdown("**حقائق التذاكر المحسوبة برمجيًا** (قارن وقت الفتح بالوقت الحقيقي في لوحة التحكم):")
             st.text(result["ticket_facts"])
+            st.markdown("**الجدول الزمني للحالات بتوقيت الرياض:**")
+            st.text(result["status_timeline"])
             st.markdown("**رد الموديل الخام:**")
             st.code(result["raw_model_text"], language="json")
     elif not analyze_btn:
-        st.info("👈 قم بإدخال رقم الطلب والضغط على زر التصنيف لعرض النتائج هنا.")
+        st.info("👈 قم بإدخال رقم الطلب (ورقم تذكرة الشكوى) والضغط على زر التصنيف لعرض النتائج هنا.")
