@@ -338,7 +338,6 @@ CANCEL_BY_US_MAIN = "الغاء الطلب"
 
 # قيمة عمود الإجراء/الحالة لما الطلب رجيع (فقط "رجيع" لا غير)
 RETURN_ACTION_VALUE = "رجيع"
-RETURN_STATUS_NAME = "رجيع"  # اسم حالة الرجيع في سجل الحالات
 
 
 # ====== الاتصال بـ Metabase (تسجيل دخول برمجي + استعلام الأسئلة الداخلية) ======
@@ -541,6 +540,27 @@ def parse_status_rows(status_history) -> list:
     return rows
 
 
+def build_status_timeline_facts(rows: list) -> str:
+    """الجدول الزمني للحالات بتوقيت الرياض، مع المدة الخام وبساعات العمل الفعلية لكل حالة"""
+    if not rows:
+        return "⚠️ لا توجد بيانات سجل حالات صالحة للحساب."
+    lines = []
+    for r in rows:
+        raw_gap = r["closed"] - r["opened"]
+        work_gap = business_hours_duration(r["opened"], r["closed"])
+        end_text = "لسه شغالة حتى الآن" if r["active"] else r["closed"].strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"- {r['status']}: من {r['opened'].strftime('%Y-%m-%d %H:%M')} إلى {end_text} | "
+            f"المدة الخام {_format_timedelta(raw_gap)} | بساعات العمل الفعلية {_format_timedelta(work_gap)}"
+        )
+    total = rows[-1]["closed"] - rows[0]["opened"]
+    lines.append(
+        f"- إجمالي عمر الطلب من أول حالة لآخر حالة: {_format_timedelta(total)} "
+        f"(بساعات العمل الفعلية {_format_timedelta(business_hours_duration(rows[0]['opened'], rows[-1]['closed']))})"
+    )
+    return "\n".join(lines)
+
+
 def status_to_phase(status_name: str):
     name = re.sub(r"\s+", " ", str(status_name)).strip()
     if name in STATUS_TO_PHASE:
@@ -569,38 +589,6 @@ def phase_at_time(rows: list, when):
             if phase:
                 break
     return current["status"], phase
-
-
-def find_return_rows(rows: list) -> list:
-    """صفوف سجل الحالات اللي حالتها «رجيع»"""
-    return [r for r in rows if re.sub(r"\s+", " ", r["status"]).strip() == RETURN_STATUS_NAME]
-
-
-def build_status_timeline_facts(rows: list) -> str:
-    """الجدول الزمني للحالات بتوقيت الرياض، مع المدة الخام وبساعات العمل الفعلية لكل حالة"""
-    if not rows:
-        return "⚠️ لا توجد بيانات سجل حالات صالحة للحساب."
-    lines = []
-    for r in rows:
-        raw_gap = r["closed"] - r["opened"]
-        work_gap = business_hours_duration(r["opened"], r["closed"])
-        end_text = "لسه شغالة حتى الآن" if r["active"] else r["closed"].strftime("%Y-%m-%d %H:%M")
-        lines.append(
-            f"- {r['status']}: من {r['opened'].strftime('%Y-%m-%d %H:%M')} إلى {end_text} | "
-            f"المدة الخام {_format_timedelta(raw_gap)} | بساعات العمل الفعلية {_format_timedelta(work_gap)}"
-        )
-    total = rows[-1]["closed"] - rows[0]["opened"]
-    lines.append(
-        f"- إجمالي عمر الطلب من أول حالة لآخر حالة: {_format_timedelta(total)} "
-        f"(بساعات العمل الفعلية {_format_timedelta(business_hours_duration(rows[0]['opened'], rows[-1]['closed']))})"
-    )
-    returns = find_return_rows(rows)
-    if returns:
-        lines.append(
-            f"- ⚠️ الطلب مرّ بحالة «{RETURN_STATUS_NAME}» ({len(returns)} مرة)، "
-            f"أول مرة بتاريخ {returns[0]['opened'].strftime('%Y-%m-%d %H:%M')}."
-        )
-    return "\n".join(lines)
 
 
 def build_ticket_facts(tickets: list, status_rows: list, target_ids: set) -> str:
@@ -752,6 +740,7 @@ OUTPUT_EXAMPLE = """[
     "cancellation": "لا ينطبق | من العميل | من مسمار",
     "main_category": "قيمة واحدة من قائمة التصنيف الأساسي",
     "sub_category": "قيمة واحدة من قائمة التصنيف الفرعي",
+    "is_return": false,
     "responsible": ["قيمة أو أكثر من قائمة مسؤول الضرر"],
     "responsible_reasoning": "من جملتين لثلاث: ليه اخترت الجهات دي، وإيه مرحلة الطلب وقت الشكوى",
     "responsible_evidence": [{"source": "نوع المصدر + التاريخ لو موجود", "quote": "اقتباس حرفي من البيانات"}],
@@ -811,9 +800,9 @@ def build_prompt(order_id: int, order_data: dict, all_tickets: list, target_ids:
 4. سبب التأخير في غلق الشكوى: قيمة واحدة. استخدم وقت فتح التذكرة (والإغلاق إن وُجد) وتسلسل تعليقاتها والتحديثات لتحديد سبب الفجوة بين الفتح والإغلاق.
    - لا يوجد حد زمني رسمي للتأخير؛ احكم من الأدلة وليس من الرقم وحده، و"لا يوجد تأخير" لو أُغلقت الشكوى بمعالجة معقولة ومتتابعة.
    - لو الحقائق المحسوبة تقول إن التذكرة فُتحت الخميس مساءً أو الجمعة وكانت العطلة هي سبب الفجوة، اختر "تم فتح الشكوى يوم الخميس مساءا او الجمعة"، إلا لو في التعليقات سبب أوضح وأقوى (مثل تأخر رد المركز) فاختره بدلًا منها.
-5. الإجراء: بيتحدد برمجيًا من حالة «رجيع» في سجل الحالات، فمتكتبش عنه أي حاجة في الإخراج.
+5. الإجراء (is_return): اجعل القيمة true فقط لو الأدلة تثبت إن الطلب "رجيع"، يعني العميل رجّع السيارة للمركز/للخدمة مرة تانية بسبب نفس المشكلة أو مشكلة ظهرت بعد إصلاح سابق (غالبًا خلال فترة الضمان)، سواء بفحص جديد أو عرض سعر جديد. غير كده false. ولو true لازم يكون في evidence دليل يثبت ده.
 6. الأدلة (إلزامية): كل تصنيف لازم يكون معاه دليل.
-   - evidence: من 1 إلى 3 أدلة لسبب التصنيف الأساسي والفرعي وسبب التأخير.
+   - evidence: من 1 إلى 3 أدلة لسبب التصنيف الأساسي والفرعي وسبب التأخير والإجراء.
    - responsible_evidence: من 1 إلى 3 أدلة لسبب اختيار مسؤول الضرر.
    - كل دليل = source (نوع المصدر مع التاريخ/الوقت لو موجود، مثل: «وصف التذكرة»، «نتيجة التذكرة»، «تعليق تذكرة 2026-10-05 10:30»، «تحديث الطلب»، «محادثة الطلب»، «التسعير»، «الجدول الزمني للحالات») + quote (اقتباس حرفي متصل منسوخ كما هو من البيانات أعلاه بما فيها الحقائق المحسوبة، لا يتجاوز 20 كلمة، بدون تعديل أو اختصار أو علامات "..." ).
    - ممنوع تأليف اقتباسات. سيتم التحقق آليًا من وجود كل اقتباس في البيانات، وأي اقتباس غير موجود حرفيًا سيُعلَّم كغير موثوق.
@@ -940,6 +929,10 @@ def _worst_flag(flags: list) -> str:
     return "corrected" if "corrected" in flags else "exact"
 
 
+def _truthy(value) -> bool:
+    return value is True or str(value).strip().lower() in ("true", "نعم", "yes", "1", "رجيع")
+
+
 def normalize_item(raw) -> dict:
     if not isinstance(raw, dict):
         raw = {}
@@ -991,7 +984,7 @@ def normalize_item(raw) -> dict:
         "rule_note": rule_note,
         "main_category": main,
         "sub_category": sub,
-        "action": "",  # بيتحدد برمجيًا من حالة «رجيع» في analyze_complaints
+        "action": RETURN_ACTION_VALUE if _truthy(raw.get("is_return", False)) else "",
         "responsible": responsible,
         "responsible_reasoning": str(raw.get("responsible_reasoning", "")).strip(),
         "responsible_evidence_raw": raw.get("responsible_evidence", []),
@@ -1049,11 +1042,6 @@ def analyze_complaints(api_key: str, metabase_username: str, metabase_password: 
     filtered = [item for item in items if str(item["ticket_id"]) in target_ids]
     if filtered:
         items = filtered
-
-    # الإجراء: «رجيع» لو الطلب مرّ بحالة رجيع في سجل الحالات، وغير كده فاضي
-    return_rows = find_return_rows(status_rows)
-    for item in items:
-        item["action"] = RETURN_ACTION_VALUE if return_rows else ""
 
     haystack = build_haystack(order_data, [ticket_facts, status_timeline])
     for item in items:
