@@ -180,16 +180,38 @@ TICKET_ID_KEYS = ["Ticket_Id", "ticket_id", "TicketId", "id"]
 TICKET_CREATED_KEYS = ["Ticket_Created_At", "Created_At", "created_at", "createdAt"]
 TICKET_CLOSED_KEYS = ["Ticket_Closed_At", "Closed_At", "closed_at", "Resolved_At", "Ticket_Resolved_At"]
 
-# ====== مراحل طلب B2C (بتحدد فريق مسمار المسؤول عن المرحلة) ======
+# ====== مراحل الطلب (B2C والتأمين) وفريق كل مرحلة ======
 # Confirmation: بداية الطلب، تأكيد الطلب، الاتفاق على الميعاد وعلى ميعاد سحب السيارة
 # Inspection: جاري الفحص والتشخيص / التسعير / بانتظار قطع الغيار
 # REPA: مراحل الإصلاح وتسليم السيارة وحتى نهاية الطلب
 # ⚠️ ده مؤشر مساعد للموديل مش حكم نهائي. الحالات اللي مش مذكورة هنا (معلق، تم الإلغاء، تم الرفض)
 # بتاخد مرحلة آخر حالة معروفة قبلها.
-PHASES = {
-    "CONF": ("Confirmation", "CONF B2C"),
-    "INSP": ("Inspection", "INSP B2C"),
-    "REPA": ("REPA", "REPA B2C"),
+PHASE_LABELS = {"CONF": "Confirmation", "INSP": "Inspection", "REPA": "REPA"}
+
+# نوع الطلب موجود في عمود بجدول التذاكر: تأمين / B2C / MM / WALKIN
+ORDER_TYPE_LABELS = {"INSURANCE": "تأمين", "B2C": "B2C", "MM": "MM", "WALKIN": "WALKIN"}
+
+# فرق المراحل حسب نوع الطلب. التأمين فرقه BO. أما MM وWALKIN فمفيهمش مراحل أصلًا
+# (المسؤول الداخلي فيهم: مشرف BO أو مزود الخدمة).
+STAGE_TEAMS = {
+    "B2C": {"CONF": "CONF B2C", "INSP": "INSP B2C", "REPA": "REPA B2C"},
+    "INSURANCE": {"CONF": "CONF BO", "INSP": "INSP BO", "REPA": "REPA BO"},
+}
+ALL_STAGE_TEAMS = [team for teams in STAGE_TEAMS.values() for team in teams.values()]
+NO_STAGE_TYPES = {"MM", "WALKIN"}
+
+# لو عارف اسم عمود نوع الطلب بالظبط في جدول التذاكر اكتبه هنا، وإلا الكود بيكتشفه تلقائيًا
+ORDER_TYPE_COLUMN = ""
+ORDER_TYPE_NAME_HINTS = ["type", "نوع"]
+# أعمدة معروفة مش هي عمود النوع (عشان منلخبطش بين قيمة زي "تأمين" كتصنيف تذكرة ونوع الطلب)
+NON_TYPE_COLUMNS = {
+    "Ticket_Category_Name", "Ticket_Description", "Ticket_Result", "Ticket_Status",
+    "Ticket_Creator", "Current_Order_Status", "City_Name",
+}
+# الصيغ المقبولة لكل نوع (بعد التطبيع: بدون تشكيل أو علامات ترقيم، وأشكال الألف موحدة)
+ORDER_TYPE_ALIASES = {
+    "تامين": "INSURANCE", "التامين": "INSURANCE", "insurance": "INSURANCE", "ins": "INSURANCE",
+    "b2c": "B2C", "mm": "MM", "walkin": "WALKIN", "walk in": "WALKIN",
 }
 STATUS_TO_PHASE = {
     "طلب جديد": "CONF", "طلب فوري": "CONF", "تم التأكيد": "CONF", "تم تأكيد موعدك": "CONF",
@@ -591,12 +613,94 @@ def phase_at_time(rows: list, when):
     return current["status"], phase
 
 
-def build_ticket_facts(tickets: list, status_rows: list, target_ids: set) -> str:
+def _match_order_type(value):
+    if value is None:
+        return None
+    return ORDER_TYPE_ALIASES.get(_loose(value))
+
+
+def detect_order_type(ticket: dict):
+    """يرجّع (نوع الطلب، اسم العمود اللي اتقرا منه) من صف تذكرة، أو (None, None) لو مش لاقيه"""
+    if not isinstance(ticket, dict):
+        return None, None
+    if ORDER_TYPE_COLUMN and ORDER_TYPE_COLUMN in ticket:
+        found = _match_order_type(ticket[ORDER_TYPE_COLUMN])
+        return (found, ORDER_TYPE_COLUMN) if found else (None, None)
+    # 1) أعمدة اسمها بيدل على النوع (مثلاً Order_Type)
+    for key, value in ticket.items():
+        name = str(key).lower()
+        if any(hint in name for hint in ORDER_TYPE_NAME_HINTS):
+            found = _match_order_type(value)
+            if found:
+                return found, key
+    # 2) أي عمود تاني قيمته بالكامل تساوي نوع معروف (ماعدا الأعمدة المعروفة إنها مش نوع)
+    for key, value in ticket.items():
+        if key in NON_TYPE_COLUMNS:
+            continue
+        found = _match_order_type(value)
+        if found:
+            return found, key
+    return None, None
+
+
+def detect_order_type_for_tickets(tickets: list, target_ids: list):
+    """نوع الطلب من التذاكر المطلوبة أولًا، وبعدها باقي تذاكر الطلب"""
+    ordered = [t for t in tickets if isinstance(t, dict) and str(_first_value(t, TICKET_ID_KEYS)) in target_ids]
+    ordered += [t for t in tickets if isinstance(t, dict) and t not in ordered]
+    for ticket in ordered:
+        order_type, column = detect_order_type(ticket)
+        if order_type:
+            return order_type, column
+    return None, None
+
+
+def describe_order_type(order_type, column) -> str:
+    if order_type is None:
+        return ("نوع الطلب: غير متوفر في بيانات التذاكر ← افترض B2C ما لم تدل الأدلة صراحة على غير ذلك، "
+                "وبيّن في الأسباب إن النوع مش معروف.")
+    label = ORDER_TYPE_LABELS[order_type]
+    source = f" (من عمود {column})" if column else ""
+    if order_type in NO_STAGE_TYPES:
+        return (f"نوع الطلب: {label}{source} ← لا توجد مراحل؛ ممنوع استخدام أي فريق مرحلة، "
+                f"والمسؤول الداخلي هو «مشرف BO» أو «مزود الخدمة».")
+    teams = STAGE_TEAMS[order_type]
+    return (f"نوع الطلب: {label}{source} ← فرق المراحل: Confirmation={teams['CONF']} | "
+            f"Inspection={teams['INSP']} | REPA={teams['REPA']}.")
+
+
+def apply_order_type_rules(responsible: list, order_type):
     """
-    حقائق محسوبة بدقة ببايثون لكل تذكرة: وقت الفتح ويومه، وهل اتفتحت الخميس مساءً أو الجمعة،
-    ومرحلة الطلب وقت فتح الشكوى (من سجل الحالات)، ومدة الإغلاق لو وقت الإغلاق متاح.
+    يراجع مسؤول الضرر مقابل نوع الطلب:
+    - B2C: أي فريق مرحلة BO بيتحول لنظيره B2C. التأمين: العكس.
+    - MM/WALKIN: مفيش مراحل، فأي فريق مرحلة بيتشال.
+    يرجّع (القائمة النهائية، ملاحظات توضح اللي اتغيّر).
     """
-    lines = []
+    notes, result = [], []
+    for team in responsible:
+        new_team = team
+        if order_type == "B2C" and team in STAGE_TEAMS["INSURANCE"].values():
+            new_team = team.replace(" BO", " B2C")
+            notes.append(f"تم تحويل «{team}» إلى «{new_team}» لأن نوع الطلب B2C.")
+        elif order_type == "INSURANCE" and team in STAGE_TEAMS["B2C"].values():
+            new_team = team.replace(" B2C", " BO")
+            notes.append(f"تم تحويل «{team}» إلى «{new_team}» لأن نوع الطلب تأمين.")
+        elif order_type in NO_STAGE_TYPES and team in ALL_STAGE_TEAMS:
+            notes.append(
+                f"تم حذف «{team}» لأن نوع الطلب {ORDER_TYPE_LABELS[order_type]} لا توجد فيه مراحل "
+                f"(المسؤول الداخلي: مشرف BO أو مزود الخدمة)."
+            )
+            continue
+        if new_team not in result:
+            result.append(new_team)
+    return result, notes
+
+
+def build_ticket_facts(tickets: list, status_rows: list, target_ids: set, order_type=None, type_column=None) -> str:
+    """
+    حقائق محسوبة بدقة ببايثون: نوع الطلب، ولكل تذكرة: وقت الفتح ويومه، وهل اتفتحت الخميس مساءً أو
+    الجمعة، ومرحلة الطلب وفريقها وقت فتح الشكوى (من سجل الحالات)، ومدة الإغلاق لو وقت الإغلاق متاح.
+    """
+    lines = [describe_order_type(order_type, type_column)]
     for ticket in tickets:
         if not isinstance(ticket, dict):
             continue
@@ -620,10 +724,12 @@ def build_ticket_facts(tickets: list, status_rows: list, target_ids: set) -> str
                 parts.append("فُتحت داخل أيام العمل (ليست الخميس مساءً ولا الجمعة).")
 
             status_name, phase = phase_at_time(status_rows, created)
-            if status_name and phase:
-                phase_label, team = PHASES[phase]
+            if status_name and order_type in NO_STAGE_TYPES:
+                parts.append(f"حالة الطلب وقت فتح الشكوى: «{status_name}» (لا توجد مراحل لنوع الطلب هذا).")
+            elif status_name and phase:
+                team = STAGE_TEAMS.get(order_type or "B2C")[phase]
                 parts.append(
-                    f"حالة الطلب وقت فتح الشكوى: «{status_name}» ← مرحلة {phase_label} (فريق {team})."
+                    f"حالة الطلب وقت فتح الشكوى: «{status_name}» ← مرحلة {PHASE_LABELS[phase]} (فريق {team})."
                 )
             elif status_name:
                 parts.append(f"حالة الطلب وقت فتح الشكوى: «{status_name}» (مرحلتها غير محددة، استنتجها من الأدلة).")
@@ -642,7 +748,7 @@ def build_ticket_facts(tickets: list, status_rows: list, target_ids: set) -> str
 
         lines.append(" ".join(parts))
 
-    return "\n".join(lines) if lines else "لا توجد تذاكر."
+    return "\n".join(lines)
 
 
 # ====== التحقق من الأدلة: هل الاقتباس موجود فعلاً في البيانات؟ ======
@@ -717,21 +823,26 @@ def format_sub_categories() -> str:
 # شرح منطق اختيار مسؤول الضرر (أمثلة توضّح طريقة التفكير، مش جدول ثابت)
 RESPONSIBLE_GUIDE = """الفكرة العامة: مسؤول الضرر يتكوّن من جزئين:
  (أ) الجهة اللي نفّذت الشغل أو تسببت فعليًا في المشكلة (مركز، قطع غيار، سطحة، تأمين، عميل... إلخ).
- (ب) فريق مسمار المسؤول عن المرحلة اللي حصلت فيها المشكلة، بيدخل كمسؤول لما يكون التقصير في المتابعة أو التحديث أو التنسيق أو التأكد من الجودة أو الالتزام بالمواعيد.
+ (ب) الفريق الداخلي المسؤول عن المرحلة اللي حصلت فيها المشكلة، بيدخل كمسؤول لما يكون التقصير في المتابعة أو التحديث أو التنسيق أو التأكد من الجودة أو الالتزام بالمواعيد.
 
-مراحل طلب B2C وفريق كل مرحلة:
- - Confirmation (فريق CONF B2C): بداية الطلب، تأكيد الطلب، الاتفاق على الميعاد، الاتفاق على ميعاد سحب السيارة، وهكذا.
- - Inspection (فريق INSP B2C): لما يكون الطلب في جاري الفحص والتشخيص أو التسعير أو بانتظار قطع الغيار.
- - REPA (فريق REPA B2C): مراحل الإصلاحات وتسليم السيارة وحتى نهاية الطلب.
- المرحلة بتتحدد من حالة الطلب وقت فتح الشكوى (موضحة لكل تذكرة في الحقائق المحسوبة). اعتمد عليها، ولا تخالفها إلا لو الأدلة تثبت بوضوح إن الشكوى تخص مرحلة تانية.
+نوع الطلب (موضح أول سطر في الحقائق المحسوبة، ومصدره عمود نوع الطلب في جدول التذاكر) هو اللي بيحدد الفرق:
+ - B2C: فرق المراحل CONF B2C / INSP B2C / REPA B2C.
+ - تأمين: نفس المراحل لكن فرقها BO: CONF BO / INSP BO / REPA BO.
+ - MM أو WALKIN: مفيش مراحل أصلًا، فممنوع استخدام أي فريق مرحلة (CONF / INSP / REPA بنوعيها). المسؤول الداخلي هنا هو «مشرف BO» (لما يكون التقصير في المتابعة أو الجودة أو التحديث) و«مزود الخدمة» (الجهة المنفذة أو المتسببة)، أو الاتنين. والأسباب الخارجية (عميل، قطع غيار، تأمين، سطحة... إلخ) بتفضل متاحة لو الأدلة بتثبتها.
 
-أمثلة توضح طريقة التفكير (طبّق نفس المنطق على أي شكوى، ولا تعتبرها حالات حصرية):
+مراحل الطلب (للـ B2C والتأمين فقط):
+ - Confirmation: بداية الطلب، تأكيد الطلب، الاتفاق على الميعاد، الاتفاق على ميعاد سحب السيارة، وهكذا.
+ - Inspection: لما يكون الطلب في جاري الفحص والتشخيص أو التسعير أو بانتظار قطع الغيار.
+ - REPA: مراحل الإصلاحات وتسليم السيارة وحتى نهاية الطلب.
+ المرحلة بتتحدد من حالة الطلب وقت فتح الشكوى (موضحة لكل تذكرة في الحقائق المحسوبة مع اسم الفريق حسب نوع الطلب). اعتمد عليها، ولا تخالفها إلا لو الأدلة تثبت بوضوح إن الشكوى تخص مرحلة تانية.
+
+أمثلة توضح طريقة التفكير (مكتوبة بأسماء فرق B2C؛ في التأمين استبدلها بفرق BO، وفي MM/WALKIN استبدل «مركز» بـ«مزود الخدمة» وفريق المرحلة بـ«مشرف BO»). طبّق نفس المنطق على أي شكوى، ولا تعتبرها حالات حصرية:
  1) العميل مش راضي عن جودة الإصلاح: المركز هو المسؤول عن تنفيذ الإصلاح، وREPA B2C هو المسؤول عن التأكد من جودة الإصلاحات ← "مركز" + "REPA B2C".
  2) تأخير في الإصلاح:
     - لو قطع الغيار هي سبب التأخير ← "قطع غيار".
     - لو مش قطع الغيار ← "مركز" هو المسؤول عن التأخير.
     - ويدخل معاه "REPA B2C" لو كان للطلب موعد/مدة محددة للعميل وتخطاها الطلب (مثلًا اتحدد له 5 أيام عمل واستغرق 7) ولم يتم تحديث العميل بأيام العمل الزيادة.
- القاعدة اللي بتتكرر: الجهة المنفّذة هي المسؤولة عن الشغل نفسه، وفريق المرحلة مسؤول عن الجودة والمتابعة وتحديث العميل في مرحلته. لو الدليل بيثبت إن فريق المرحلة تابع وحدّث العميل بشكل سليم، متدخلوش."""
+ القاعدة اللي بتتكرر: الجهة المنفّذة هي المسؤولة عن الشغل نفسه، والفريق الداخلي مسؤول عن الجودة والمتابعة وتحديث العميل في مرحلته. لو الدليل بيثبت إن الفريق الداخلي تابع وحدّث العميل بشكل سليم، متدخلوش."""
 
 
 OUTPUT_EXAMPLE = """[
@@ -1032,7 +1143,8 @@ def analyze_complaints(api_key: str, metabase_username: str, metabase_password: 
         # لو سجل الحالات مش متاح، بنبعت الخام عشان الموديل يشوف الخطأ/البيانات
         status_timeline += "\n(البيانات الخام): " + compact_dump(order_data.get("status_history"), 2000)
 
-    ticket_facts = build_ticket_facts(all_tickets, status_rows, set(target_ids))
+    order_type, order_type_column = detect_order_type_for_tickets(all_tickets, target_ids)
+    ticket_facts = build_ticket_facts(all_tickets, status_rows, set(target_ids), order_type, order_type_column)
     prompt_text = build_prompt(order_id, order_data, all_tickets, target_ids, ticket_facts, status_timeline)
 
     raw_text = call_gemini_with_fallback(api_key, prompt_text)
@@ -1044,9 +1156,16 @@ def analyze_complaints(api_key: str, metabase_username: str, metabase_password: 
         items = filtered
 
     haystack = build_haystack(order_data, [ticket_facts, status_timeline])
+    order_type_label = ORDER_TYPE_LABELS.get(order_type, "غير محدد")
     for item in items:
         item["evidence"] = verify_evidence(item.pop("evidence_raw"), haystack)
         item["responsible_evidence"] = verify_evidence(item.pop("responsible_evidence_raw"), haystack)
+
+        # مراجعة مسؤول الضرر مقابل نوع الطلب (تحويل/حذف فرق المراحل غير المناسبة)
+        item["responsible"], item["type_notes"] = apply_order_type_rules(item["responsible"], order_type)
+        if not item["responsible"]:
+            item["flags"]["responsible"] = "invalid"
+        item["order_type_label"] = order_type_label
 
     truncated = [
         key for key, value in order_data.items()
@@ -1062,6 +1181,9 @@ def analyze_complaints(api_key: str, metabase_username: str, metabase_password: 
         "truncated_sources": truncated,
         "target_ids": target_ids,
         "order_id": order_id,
+        "order_type": order_type,
+        "order_type_label": order_type_label,
+        "order_type_column": order_type_column,
     }
 
 
@@ -1122,16 +1244,17 @@ def render_ticket_result(item: dict):
         )
 
     rows_html = (
-        row("التصنيف الأساسي", item["main_category"], item["flags"]["main_category"])
+        row("نوع الطلب", item.get("order_type_label", "غير محدد"))
+        + row("التصنيف الأساسي", item["main_category"], item["flags"]["main_category"])
         + row("تصنيف فرعي", item["sub_category"], item["flags"]["sub_category"])
         + row("الإجراء / الحالة", item["action"] or "— (يُترك فارغًا)")
         + row("مسؤول الضرر", display_responsible(item), item["flags"]["responsible"])
         + row("سبب التأخير في غلق الشكوى", item["delay_reason"], item["flags"]["delay_reason"])
     )
 
-    note_html = (
-        f'<div class="reasoning-box">⚖️ {html.escape(item["rule_note"])}</div>'
-        if item.get("rule_note") else ""
+    notes = [n for n in [item.get("rule_note", "")] + item.get("type_notes", []) if n]
+    note_html = "".join(
+        f'<div class="reasoning-box">⚖️ {html.escape(note)}</div>' for note in notes
     )
 
     st.markdown(
@@ -1245,6 +1368,12 @@ with col2:
     if result:
         for item in result["items"]:
             render_ticket_result(item)
+
+        if result["order_type"] is None:
+            st.warning(
+                "⚠️ نوع الطلب (تأمين / B2C / MM / WALKIN) لم يُكتشف في جدول التذاكر، فتم افتراض B2C. "
+                "راجع قسم الـ Debug وشوف أسماء أعمدة التذاكر، ولو عارف اسم العمود اكتبه في ORDER_TYPE_COLUMN."
+            )
 
         if result["truncated_sources"]:
             st.warning(
